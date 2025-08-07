@@ -1,7 +1,6 @@
 import asyncio
 import binascii
 from beaconscanner import BeaconScanner
-from eddystone import EddystoneTLMFrame, EddystoneUIDFrame, EddystoneFilter
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -20,25 +19,24 @@ TARGET_UID_UUID = "FEAA"  # Eddystone UID frame UUID
 
 def process_packet(packet):
     try:
-        # Filter out only Eddystone frames
-        if EddystoneFilter.filter(packet):
-            # Check if it's an Eddystone TLM frame
-            if packet.get_type() == "EddystoneTLM":
-                tlm_frame = EddystoneTLMFrame(packet)
-                if tlm_frame.is_valid():
-                    # Extract data from the TLM frame
+        # Check if the packet contains an Eddystone frame
+        if packet.advertisement_data.get("Service UUIDs") == [TARGET_TLM_UUID, TARGET_UID_UUID]:
+            # Decode TLM frame (E4BE)
+            if TARGET_TLM_UUID in packet.advertisement_data.get("Service UUIDs"):
+                # Extract battery, temperature, and other telemetry data
+                tlm_data = decode_tlm(packet.payload)
+                if tlm_data:
+                    battery_level, temperature = tlm_data
                     peer_address = packet.addr
                     device_name = packet.get_name() or "Unknown"
-                    battery_level = tlm_frame.battery
-                    temperature = tlm_frame.temperature
                     rssi = packet.rssi
                     
-                    # Print out the data for logging
+                    # Log the data
                     hex_data = binascii.hexlify(packet.payload).decode().upper()
                     now = datetime.utcnow().isoformat() + "Z"
                     print(f"📡 {peer_address} | {device_name} | TLM Frame | Battery: {battery_level}% | Temp: {temperature}°C | RSSI: {rssi}")
                     
-                    # Add the data to Firebase
+                    # Add to Firebase
                     doc = {
                         "timestamp": now,
                         "device_address": peer_address,
@@ -49,26 +47,22 @@ def process_packet(packet):
                         "service_data_raw": hex_data
                     }
                     success_collection.add(doc)
-                else:
-                    print("⚠️ Invalid TLM frame received.")
-            
-            # Check if it's an Eddystone UID frame with UUID FEAA
-            elif packet.get_type() == "EddystoneUID":
-                uid_frame = EddystoneUIDFrame(packet)
-                if uid_frame.is_valid():
-                    # Extract data from the UID frame
+
+            # Decode UID frame (FEAA)
+            if TARGET_UID_UUID in packet.advertisement_data.get("Service UUIDs"):
+                uid_data = decode_uid(packet.payload)
+                if uid_data:
+                    namespace, instance = uid_data
                     peer_address = packet.addr
                     device_name = packet.get_name() or "Unknown"
-                    namespace = uid_frame.namespace
-                    instance = uid_frame.instance
                     rssi = packet.rssi
                     
-                    # Print out the data for logging
+                    # Log the data
                     hex_data = binascii.hexlify(packet.payload).decode().upper()
                     now = datetime.utcnow().isoformat() + "Z"
                     print(f"📡 {peer_address} | {device_name} | UID Frame | Namespace: {namespace} | Instance: {instance} | RSSI: {rssi}")
                     
-                    # Add the data to Firebase
+                    # Add to Firebase
                     doc = {
                         "timestamp": now,
                         "device_address": peer_address,
@@ -79,8 +73,6 @@ def process_packet(packet):
                         "service_data_raw": hex_data
                     }
                     success_collection.add(doc)
-                else:
-                    print("⚠️ Invalid UID frame received.")
         else:
             print("⚠️ Non-Eddystone packet detected.")
     except Exception as e:
@@ -90,6 +82,24 @@ def process_packet(packet):
             "timestamp": now,
             "error": str(e)
         })
+
+def decode_tlm(payload):
+    """Decode the Eddystone TLM frame"""
+    # Assuming the TLM frame contains the battery and temperature at fixed positions
+    if len(payload) >= 6:
+        battery_level = payload[2]  # Byte 2 is battery level (as an example)
+        temperature = (payload[3] << 8) + payload[4]  # Temperature data (just an example)
+        return battery_level, temperature
+    return None
+
+def decode_uid(payload):
+    """Decode the Eddystone UID frame"""
+    # Extract the namespace and instance from the UID frame (example positions)
+    if len(payload) >= 20:
+        namespace = payload[2:10]  # Namespace is from byte 2 to 9
+        instance = payload[10:18]  # Instance is from byte 10 to 17
+        return namespace, instance
+    return None
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
