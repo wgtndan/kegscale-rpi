@@ -46,13 +46,21 @@ def process_packet(data):
             "error": str(e)
         })
 
+class CustomBLEScanRequester(aiobs.BLEScanRequester):
+    def __init__(self, process_packet_callback):
+        super().__init__()
+        self.process_packet_callback = process_packet_callback
+
+    def handle_advertisement(self, data):
+        self.process_packet_callback(data)
+
 async def main():
     # Create the BLE scanner
     scanner = aiobs.create_bt_socket(0)  # Use 0 for the default Bluetooth adapter
     print("🔍 Listening for BLE advertisements...")
 
-    # Use BLEScanRequester to handle packets and pass the process_packet callback
-    requester = aiobs.BLEScanRequester(process_packet)
+    # Create custom BLEScanRequester with the process_packet callback
+    requester = CustomBLEScanRequester(process_packet)
 
     # Start scanning
     await scanner.start(requester)
