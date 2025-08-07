@@ -40,7 +40,7 @@ def process_packet(device, advertisement_data):
             # "tx_power": advertisement_data.tx_power,
         }
 
-        if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19"]:
+        if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19", "6C:D5:33:F7:94:04"]:
             return
         
         # # Print detailed info
