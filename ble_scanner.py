@@ -40,6 +40,9 @@ def process_packet(device, advertisement_data):
             "local_name": advertisement_data.local_name or "N/A",
             # "tx_power": advertisement_data.tx_power,
         }
+
+        if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19"]:
+            return
         
         # Print detailed info
         print(f"📱 Address: {data['address']}")
@@ -94,7 +97,7 @@ def decode_uid(advertisement_data):
     return None
 
 async def status_update():
-    """Every 60 seconds, log the status with beacon count."""
+    """Every 30 seconds, log the status with beacon count."""
     while True:
         try:
             now = datetime.utcnow().isoformat() + "Z"
@@ -107,7 +110,7 @@ async def status_update():
             print(f"📊 Status Update: {beacon_count}")
         except Exception as e:
             print(f"⚠️ Error logging status update: {str(e)}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
