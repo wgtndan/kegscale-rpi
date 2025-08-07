@@ -48,20 +48,21 @@ def process_packet(data):
         })
 
 async def main():
-    event_loop = asyncio.get_running_loop()
-    scanner = aiobs.create_bt_socket(0)
-    conn, protocol = await event_loop._create_connection_transport(
-        scanner,
-        lambda: aiobs.BLEScanRequester(process_packet),
-        None,
-        None
-    )
+    # Create the BLE scanner
+    scanner = aiobs.create_bt_socket(0)  # Use 0 for the default Bluetooth adapter
     print("🔍 Listening for BLE advertisements...")
+
+    # Set up the scan and the callback to process packets
+    scanner.register_callback(process_packet)
+
+    # Start scanning
+    await scanner.start()
     try:
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
+        await scanner.stop()  # Make sure to stop the scanner gracefully
 
 if __name__ == "__main__":
     asyncio.run(main())
