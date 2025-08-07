@@ -23,8 +23,8 @@ beacon_count = {}
 def process_packet(device, advertisement_data):
     global beacon_count
     try:
-        # Filter for specific MAC address
-        if device.address == "5F:84:38:F4:CE:3E":
+        # Fuzzy match for MAC address - looks for devices starting with "5F:84"
+        if device.address.upper().startswith("5F:84"):
             now = datetime.utcnow().isoformat() + "Z"
             
             # Collect all available data
@@ -60,8 +60,8 @@ def process_packet(device, advertisement_data):
             # Save to Firebase
             success_collection.add(data)
             
-            # Update beacon count
-            beacon_count[device.address] = beacon_count.get(device.address, 0) + 1
+        # Update beacon count
+        beacon_count[device.address] = beacon_count.get(device.address, 0) + 1
 
     except Exception as e:
         now = datetime.utcnow().isoformat() + "Z"
