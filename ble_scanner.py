@@ -123,19 +123,13 @@ async def main():
     # Start scanning
     await scanner.start()
     
-    # Create and store the status update task
-    status_task = asyncio.create_task(status_update())
-    
     try:
-        # Wait for both the scanner and status update tasks
-        await asyncio.gather(
-            status_task,
-            asyncio.sleep(3600)  # Keep alive for 1 hour
-        )
+        # Create and run the status update task indefinitely
+        status_task = asyncio.create_task(status_update())
+        # Wait forever or until interrupted
+        await status_task
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
-        # Cancel the status update task
-        status_task.cancel()
         await scanner.stop()  # Stop the scanner gracefully
 
 if __name__ == "__main__":
