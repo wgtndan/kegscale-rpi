@@ -23,8 +23,6 @@ beacon_count = {}
 def process_packet(device, advertisement_data):
     global beacon_count
     try:
-        # Fuzzy match for MAC address - looks for devices starting with "5F:84"
-        # if device.address.upper().startswith("5F"):
         now = datetime.utcnow().isoformat() + "Z"
         
         # Collect all available data
@@ -38,6 +36,7 @@ def process_packet(device, advertisement_data):
             "manufacturer_data": str({k: v.hex() for k, v in advertisement_data.manufacturer_data.items()}) or {'nothing': 'N/A'},
             "local_name": advertisement_data.local_name or "N/A",
             # "tx_power": advertisement_data.tx_power,
+            "device": device
         }
 
         if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19", "6C:D5:33:F7:94:04"]:
@@ -75,27 +74,6 @@ def process_packet(device, advertisement_data):
             "data": str(data)
         })
 
-def decode_tlm(advertisement_data):
-    """Decode the Eddystone TLM frame"""
-    # Access service data directly
-    if TARGET_TLM_UUID in advertisement_data.service_data:
-        service_data = advertisement_data.service_data[TARGET_TLM_UUID]
-        if len(service_data) >= 6:
-            battery_level = service_data[2]
-            temperature = (service_data[3] << 8) + service_data[4]
-            return battery_level, temperature
-    return None
-
-def decode_uid(advertisement_data):
-    """Decode the Eddystone UID frame"""
-    if TARGET_UID_UUID in advertisement_data.service_data:
-        service_data = advertisement_data.service_data[TARGET_UID_UUID]
-        if len(service_data) >= 20:
-            namespace = service_data[2:10]
-            instance = service_data[10:18]
-            return namespace, instance
-    return None
-
 async def status_update():
     """Every 60 seconds, log the status with beacon count if any beacons were detected."""
     while True:
@@ -120,14 +98,14 @@ async def main():
     # Create the BLE scanner using bleak (bleak 1.0.1)
     scanner = BleakScanner(detection_callback=process_packet)
     
-    # Start scanning
-    await scanner.start()
     
     try:
         # Create and run the status update task indefinitely
         status_task = asyncio.create_task(status_update())
         # Wait forever or until interrupted
         await status_task
+        # Start scanning
+        await scanner.start()
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
         await scanner.stop()  # Stop the scanner gracefully
