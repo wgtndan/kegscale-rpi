@@ -131,8 +131,11 @@ async def main():
     # Create the BLE scanner using bleak
     scanner = BleakScanner()
 
-    # Start scanning with the callback to process packets
-    await scanner.start(detection_callback=process_packet)
+    # Register the callback for detected packets
+    scanner.register_detection_callback(process_packet)
+    
+    # Start scanning
+    await scanner.start()
     
     # Run status update in the background
     asyncio.create_task(status_update())
