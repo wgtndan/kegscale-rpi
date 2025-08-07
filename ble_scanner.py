@@ -31,12 +31,12 @@ def process_packet(device, advertisement_data):
         # Collect all available data
         data = {
             "timestamp": now,
-            "address": device.address,
+            "address": device.address or "Unknown",
             "name": device.name or "Unknown",
             # "rssi": device.rssi,
-            "service_uuids": advertisement_data.service_uuids or [],
-            "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()} or {},
-            "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()} or {},
+            "service_uuids": advertisement_data.service_uuids or [''],
+            "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()} or {'nothing': 'N/A'},
+            "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()} or {'nothing': 'N/A'},
             "local_name": advertisement_data.local_name or "N/A",
             # "tx_power": advertisement_data.tx_power,
         }
