@@ -98,16 +98,20 @@ async def main():
     # Create the BLE scanner using bleak (bleak 1.0.1)
     scanner = BleakScanner(detection_callback=process_packet)
     
-    
     try:
-        # Create and run the status update task indefinitely
-        status_task = asyncio.create_task(status_update())
-        # Wait forever or until interrupted
-        await status_task
-        # Start scanning
+        # Start scanning first
         await scanner.start()
+        
+        # Create status update task
+        status_task = asyncio.create_task(status_update())
+        
+        # Wait forever or until interrupted
+        while True:
+            await asyncio.sleep(1)
+            
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
+        status_task.cancel()  # Cancel the status update task
         await scanner.stop()  # Stop the scanner gracefully
 
 if __name__ == "__main__":
