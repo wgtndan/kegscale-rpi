@@ -100,6 +100,7 @@ async def status_update():
     """Every 60 seconds, log the status with beacon count if any beacons were detected."""
     while True:
         try:
+            print(f"📊 Checking Status...")
             if beacon_count:  # Only proceed if beacon_count is not empty
                 now = datetime.utcnow().isoformat() + "Z"
                 status_message = {
@@ -111,7 +112,7 @@ async def status_update():
                 print(f"📊 Status Update: {beacon_count}")
         except Exception as e:
             print(f"⚠️ Error logging status update: {str(e)}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
