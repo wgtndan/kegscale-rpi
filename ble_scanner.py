@@ -24,41 +24,41 @@ def process_packet(device, advertisement_data):
     global beacon_count
     try:
         # Fuzzy match for MAC address - looks for devices starting with "5F:84"
-        if device.address.upper().startswith("5F"):
-            print("\n🔍 Device Found:")
-            now = datetime.utcnow().isoformat() + "Z"
-            
-            # Collect all available data
-            data = {
-                "timestamp": now,
-                "address": device.address,
-                "name": device.name or "Unknown",
-                "rssi": device.rssi,
-                "service_uuids": advertisement_data.service_uuids or [],
-                "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()},
-                "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()},
-                "local_name": advertisement_data.local_name,
-                "tx_power": advertisement_data.tx_power,
-            }
-            
-            # Print detailed info
-            print(f"📱 Address: {data['address']}")
-            print(f"📛 Name: {data['name']}")
-            print(f"📶 RSSI: {data['rssi']}dBm")
-            if data['service_uuids']:
-                print(f"🔧 Service UUIDs: {data['service_uuids']}")
-            if data['service_data']:
-                print(f"📄 Service Data: {data['service_data']}")
-            if data['manufacturer_data']:
-                print(f"🏭 Manufacturer Data: {data['manufacturer_data']}")
-            if data['local_name']:
-                print(f"✏️ Local Name: {data['local_name']}")
-            if data['tx_power'] is not None:
-                print(f"📡 TX Power: {data['tx_power']}dBm")
-            print("-" * 50)
-            
-            # Save to Firebase
-            success_collection.add(data)
+        # if device.address.upper().startswith("5F"):
+        print("\n🔍 Device Found:")
+        now = datetime.utcnow().isoformat() + "Z"
+        
+        # Collect all available data
+        data = {
+            "timestamp": now,
+            "address": device.address,
+            "name": device.name or "Unknown",
+            "rssi": device.rssi,
+            "service_uuids": advertisement_data.service_uuids or [],
+            "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()},
+            "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()},
+            "local_name": advertisement_data.local_name,
+            "tx_power": advertisement_data.tx_power,
+        }
+        
+        # Print detailed info
+        print(f"📱 Address: {data['address']}")
+        print(f"📛 Name: {data['name']}")
+        print(f"📶 RSSI: {data['rssi']}dBm")
+        if data['service_uuids']:
+            print(f"🔧 Service UUIDs: {data['service_uuids']}")
+        if data['service_data']:
+            print(f"📄 Service Data: {data['service_data']}")
+        if data['manufacturer_data']:
+            print(f"🏭 Manufacturer Data: {data['manufacturer_data']}")
+        if data['local_name']:
+            print(f"✏️ Local Name: {data['local_name']}")
+        if data['tx_power'] is not None:
+            print(f"📡 TX Power: {data['tx_power']}dBm")
+        print("-" * 50)
+        
+        # Save to Firebase
+        success_collection.add(data)
             
         # Update beacon count
         beacon_count[device.address] = beacon_count.get(device.address, 0) + 1
