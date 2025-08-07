@@ -46,30 +46,19 @@ def process_packet(data):
             "error": str(e)
         })
 
-class CustomBLEScanRequester(aiobs.BLEScanRequester):
-    def __init__(self, process_packet_callback):
-        super().__init__()
-        self.process_packet_callback = process_packet_callback
-
-    def handle_advertisement(self, data):
-        self.process_packet_callback(data)
-
 async def main():
-    # Create the BLE scanner
+    # Create the BLE scanner (HCI socket)
     scanner = aiobs.create_bt_socket(0)  # Use 0 for the default Bluetooth adapter
     print("🔍 Listening for BLE advertisements...")
 
-    # Create custom BLEScanRequester with the process_packet callback
-    requester = CustomBLEScanRequester(process_packet)
+    # Start the scan and process packets
+    scanner.scan(process_packet)
 
-    # Start scanning
-    await scanner.start(requester)
     try:
         while True:
             await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
-        await scanner.stop()  # Make sure to stop the scanner gracefully
 
 if __name__ == "__main__":
     asyncio.run(main())
