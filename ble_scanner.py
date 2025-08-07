@@ -91,48 +91,77 @@ def process_packet(data):
             "raw_data": binascii.hexlify(data).decode() if data else "No data"
         })
 
-class MyScanRequester(aiobs.BLEScanRequester):
-    def process_data(self, data):
-        process_packet(data)
-
 async def main():
-    # Create the BLE socket
-    mysocket = aiobs.create_bt_socket(0)  # Use 0 for the default Bluetooth adapter
-    
     print("🔍 Listening for BLE advertisements...")
     print(f"🎯 Looking for UUIDs: {', '.join(TARGET_UUIDS)}")
     
     try:
-        # Create the scan requester
-        fac = MyScanRequester()
-        
-        # Start the connection
+        # Method 1: Try the standard aioblescan approach
         event_loop = asyncio.get_event_loop()
-        conn = event_loop.create_connection(lambda: fac, sock=mysocket)
-        transport, protocol = await conn
+        
+        # Create socket and connection
+        mysocket = aiobs.create_bt_socket(0)
+        fac = aiobs.BLEScanRequester()
+        fac.process = process_packet
+        
+        conn_coro = event_loop.create_connection(lambda: fac, sock=mysocket)
+        transport, protocol = await conn_coro
         
         print("✅ Scanner started successfully")
         
-        # Keep scanning
-        while True:
-            await asyncio.sleep(60)  # Keep alive for 60 seconds at a time
+        # Keep the scanner running
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("🔚 Stopping scanner...")
             
-    except KeyboardInterrupt:
-        print("🔚 Stopping scanner...")
     except Exception as e:
-        print(f"❌ Scanner error: {e}")
-        # Log the error to Firebase
-        now = datetime.utcnow().isoformat() + "Z"
-        failure_collection.add({
-            "timestamp": now,
-            "error": f"Scanner startup error: {str(e)}"
-        })
+        print(f"❌ Primary method failed: {e}")
+        print("🔄 Trying alternative method...")
+        
+        try:
+            # Method 2: Direct socket reading approach
+            mysocket = aiobs.create_bt_socket(0)
+            mysocket.setblocking(False)  # Make socket non-blocking
+            
+            print("✅ Alternative scanner started")
+            
+            while True:
+                try:
+                    data = mysocket.recv(1024)
+                    if data:
+                        process_packet(data)
+                except BlockingIOError:
+                    # No data available, continue
+                    await asyncio.sleep(0.1)
+                except Exception as recv_error:
+                    print(f"⚠️ Receive error: {recv_error}")
+                    await asyncio.sleep(1)
+                    
+        except KeyboardInterrupt:
+            print("🔚 Stopping alternative scanner...")
+        except Exception as alt_error:
+            print(f"❌ Alternative method failed: {alt_error}")
+            print("💡 Try running with sudo, or check if Bluetooth is enabled")
+            
+            # Log the error to Firebase
+            now = datetime.utcnow().isoformat() + "Z"
+            failure_collection.add({
+                "timestamp": now,
+                "error": f"All scanner methods failed: {str(e)} | Alt: {str(alt_error)}"
+            })
     finally:
-        mysocket.close()
-        print("🔒 Socket closed")
+        try:
+            if 'mysocket' in locals():
+                mysocket.close()
+            print("🔒 Socket closed")
+        except:
+            pass
 
 if __name__ == "__main__":
     # Make sure we have the right permissions
     print("🚀 Starting BLE Eddystone Scanner")
     print("⚠️  Make sure to run with sudo for BLE permissions")
+    print("⚠️  Make sure Bluetooth is enabled: sudo systemctl enable bluetooth")
     asyncio.run(main())
