@@ -131,11 +131,8 @@ async def main():
     # Create the BLE scanner using bleak
     scanner = BleakScanner()
 
-    # Attach the process_packet function to handle detected advertisements
-    scanner.register_detection_callback(process_packet)
-
-    # Start scanning for Eddystone frames
-    await scanner.start()
+    # Start scanning with the callback to process packets
+    await scanner.start(detection_callback=process_packet)
     
     # Run status update in the background
     asyncio.create_task(status_update())
