@@ -24,7 +24,8 @@ def process_packet(device, advertisement_data):
     global beacon_count
     try:
         # Fuzzy match for MAC address - looks for devices starting with "5F:84"
-        if device.address.upper().startswith("5F:84"):
+        if device.address.upper().startswith("5F"):
+            print("\n🔍 Device Found:")
             now = datetime.utcnow().isoformat() + "Z"
             
             # Collect all available data
@@ -41,7 +42,6 @@ def process_packet(device, advertisement_data):
             }
             
             # Print detailed info
-            print("\n🔍 Device Found:")
             print(f"📱 Address: {data['address']}")
             print(f"📛 Name: {data['name']}")
             print(f"📶 RSSI: {data['rssi']}dBm")
