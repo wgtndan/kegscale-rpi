@@ -36,7 +36,8 @@ def process_packet(device, advertisement_data):
             "manufacturer_data": str({k: v.hex() for k, v in advertisement_data.manufacturer_data.items()}) or {'nothing': 'N/A'},
             "local_name": advertisement_data.local_name or "N/A",
             # "tx_power": advertisement_data.tx_power,
-            "device": str(device)
+            "device": str(device),
+            "advertisement": str(advertisement_data) or "N/A"
         }
 
         if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19", "6C:D5:33:F7:94:04"]:
