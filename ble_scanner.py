@@ -112,7 +112,7 @@ async def status_update():
                 print(f"📊 Status Update: {beacon_count}")
         except Exception as e:
             print(f"⚠️ Error logging status update: {str(e)}")
-    await asyncio.sleep(10)
+        await asyncio.sleep(10)
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
@@ -123,14 +123,19 @@ async def main():
     # Start scanning
     await scanner.start()
     
-    # Run status update in the background
-    asyncio.create_task(status_update())
-
+    # Create and store the status update task
+    status_task = asyncio.create_task(status_update())
+    
     try:
-        while True:
-            await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
+        # Wait for both the scanner and status update tasks
+        await asyncio.gather(
+            status_task,
+            asyncio.sleep(3600)  # Keep alive for 1 hour
+        )
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
+        # Cancel the status update task
+        status_task.cancel()
         await scanner.stop()  # Stop the scanner gracefully
 
 if __name__ == "__main__":
