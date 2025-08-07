@@ -23,8 +23,8 @@ beacon_count = {}
 def process_packet(device, advertisement_data):
     global beacon_count
     try:
-        # Check if the advertisement contains Eddystone TLM or UID frame
-        service_uuids = advertisement_data.get("service_uuids", [])
+        # Access service UUIDs directly
+        service_uuids = advertisement_data.service_uuids
         
         if TARGET_TLM_UUID in service_uuids:
             # Process Eddystone TLM (Telemetry) frame
@@ -91,22 +91,23 @@ def process_packet(device, advertisement_data):
 
 def decode_tlm(advertisement_data):
     """Decode the Eddystone TLM frame"""
-    # Assuming the TLM frame contains the battery and temperature at fixed positions
-    service_data = advertisement_data.get("service_data", {}).get(TARGET_TLM_UUID, [])
-    if len(service_data) >= 6:
-        battery_level = service_data[2]  # Byte 2 is battery level (as an example)
-        temperature = (service_data[3] << 8) + service_data[4]  # Temperature data (just an example)
-        return battery_level, temperature
+    # Access service data directly
+    if TARGET_TLM_UUID in advertisement_data.service_data:
+        service_data = advertisement_data.service_data[TARGET_TLM_UUID]
+        if len(service_data) >= 6:
+            battery_level = service_data[2]
+            temperature = (service_data[3] << 8) + service_data[4]
+            return battery_level, temperature
     return None
 
 def decode_uid(advertisement_data):
     """Decode the Eddystone UID frame"""
-    # Extract the namespace and instance from the UID frame (example positions)
-    service_data = advertisement_data.get("service_data", {}).get(TARGET_UID_UUID, [])
-    if len(service_data) >= 20:
-        namespace = service_data[2:10]  # Namespace is from byte 2 to 9
-        instance = service_data[10:18]  # Instance is from byte 10 to 17
-        return namespace, instance
+    if TARGET_UID_UUID in advertisement_data.service_data:
+        service_data = advertisement_data.service_data[TARGET_UID_UUID]
+        if len(service_data) >= 20:
+            namespace = service_data[2:10]
+            instance = service_data[10:18]
+            return namespace, instance
     return None
 
 async def status_update():
