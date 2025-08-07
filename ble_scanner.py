@@ -112,7 +112,7 @@ async def status_update():
                 print(f"📊 Status Update: {beacon_count}")
         except Exception as e:
             print(f"⚠️ Error logging status update: {str(e)}")
-        await asyncio.sleep(10)
+    await asyncio.sleep(10)
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
