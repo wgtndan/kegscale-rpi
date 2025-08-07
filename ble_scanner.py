@@ -50,8 +50,12 @@ def process_packet(data):
 async def main():
     event_loop = asyncio.get_running_loop()
     scanner = aiobs.create_bt_socket(0)
-    fac = event_loop.create_connection(lambda: aiobs.BLEScanRequester(process_packet), sock=scanner)
-    await fac
+    conn, protocol = await event_loop._create_connection_transport(
+        scanner,
+        lambda: aiobs.BLEScanRequester(process_packet),
+        None,
+        None
+    )
     print("🔍 Listening for BLE advertisements...")
     try:
         while True:
