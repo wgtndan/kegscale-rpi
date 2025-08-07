@@ -25,7 +25,6 @@ def process_packet(device, advertisement_data):
     try:
         # Fuzzy match for MAC address - looks for devices starting with "5F:84"
         # if device.address.upper().startswith("5F"):
-        print("\n🔍 Device Found:")
         now = datetime.utcnow().isoformat() + "Z"
         
         # Collect all available data
@@ -44,21 +43,22 @@ def process_packet(device, advertisement_data):
         if data['address'] in ["7A:29:98:88:00:FC", "61:F8:54:E2:47:19"]:
             return
         
-        # Print detailed info
-        print(f"📱 Address: {data['address']}")
-        print(f"📛 Name: {data['name']}")
-        # print(f"📶 RSSI: {data['rssi']}dBm")
-        if data['service_uuids']:
-            print(f"🔧 Service UUIDs: {data['service_uuids']}")
-        if data['service_data']:
-            print(f"📄 Service Data: {data['service_data']}")
-        if data['manufacturer_data']:
-            print(f"🏭 Manufacturer Data: {data['manufacturer_data']}")
-        if data['local_name']:
-            print(f"✏️ Local Name: {data['local_name']}")
-        # if data['tx_power'] is not None:
-        #     print(f"📡 TX Power: {data['tx_power']}dBm")
-        print("-" * 50)
+        # # Print detailed info
+        # print("\n🔍 Device Found:")
+        # print(f"📱 Address: {data['address']}")
+        # print(f"📛 Name: {data['name']}")
+        # # print(f"📶 RSSI: {data['rssi']}dBm")
+        # if data['service_uuids']:
+        #     print(f"🔧 Service UUIDs: {data['service_uuids']}")
+        # if data['service_data']:
+        #     print(f"📄 Service Data: {data['service_data']}")
+        # if data['manufacturer_data']:
+        #     print(f"🏭 Manufacturer Data: {data['manufacturer_data']}")
+        # if data['local_name']:
+        #     print(f"✏️ Local Name: {data['local_name']}")
+        # # if data['tx_power'] is not None:
+        # #     print(f"📡 TX Power: {data['tx_power']}dBm")
+        # print("-" * 50)
         
         # Save to Firebase
         success_collection.add(data)
@@ -97,20 +97,21 @@ def decode_uid(advertisement_data):
     return None
 
 async def status_update():
-    """Every 30 seconds, log the status with beacon count."""
+    """Every 60 seconds, log the status with beacon count if any beacons were detected."""
     while True:
         try:
-            now = datetime.utcnow().isoformat() + "Z"
-            status_message = {
-                "timestamp": now,
-                "message": "Status update",
-                "beacon_count": beacon_count
-            }
-            status_collection.add(status_message)
-            print(f"📊 Status Update: {beacon_count}")
+            if beacon_count:  # Only proceed if beacon_count is not empty
+                now = datetime.utcnow().isoformat() + "Z"
+                status_message = {
+                    "timestamp": now,
+                    "message": "Status update",
+                    "beacon_count": beacon_count
+                }
+                status_collection.add(status_message)
+                print(f"📊 Status Update: {beacon_count}")
         except Exception as e:
             print(f"⚠️ Error logging status update: {str(e)}")
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 async def main():
     print("🔍 Listening for BLE advertisements...")
