@@ -68,7 +68,7 @@ def process_packet(device, advertisement_data):
         print(f"⚠️ Error processing packet: {str(e)}")
         failure_collection.add({
             "timestamp": now,
-            "error": e
+            "error": str(e)
         })
 
 def decode_tlm(advertisement_data):
