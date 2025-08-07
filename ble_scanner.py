@@ -33,7 +33,7 @@ def process_packet(device, advertisement_data):
             "timestamp": now,
             "address": device.address,
             "name": device.name or "Unknown",
-            "rssi": device.rssi,
+            # "rssi": device.rssi,
             "service_uuids": advertisement_data.service_uuids or [],
             "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()},
             "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()},
@@ -44,7 +44,7 @@ def process_packet(device, advertisement_data):
         # Print detailed info
         print(f"📱 Address: {data['address']}")
         print(f"📛 Name: {data['name']}")
-        print(f"📶 RSSI: {data['rssi']}dBm")
+        # print(f"📶 RSSI: {data['rssi']}dBm")
         if data['service_uuids']:
             print(f"🔧 Service UUIDs: {data['service_uuids']}")
         if data['service_data']:
