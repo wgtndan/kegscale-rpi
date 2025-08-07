@@ -1,4 +1,3 @@
-# aioblescan-based BLE scanner for Eddystone UUID E4BE
 import aioblescan as aiobs
 import asyncio
 from datetime import datetime
@@ -52,11 +51,11 @@ async def main():
     scanner = aiobs.create_bt_socket(0)  # Use 0 for the default Bluetooth adapter
     print("🔍 Listening for BLE advertisements...")
 
-    # Set up the scan and the callback to process packets
-    scanner.register_callback(process_packet)
+    # Use BLEScanRequester to handle packets and pass the process_packet callback
+    requester = aiobs.BLEScanRequester(process_packet)
 
     # Start scanning
-    await scanner.start()
+    await scanner.start(requester)
     try:
         while True:
             await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
