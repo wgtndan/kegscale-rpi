@@ -128,11 +128,8 @@ async def status_update():
 async def main():
     print("🔍 Listening for BLE advertisements...")
     
-    # Create the BLE scanner using bleak
-    scanner = BleakScanner()
-
-    # Register the callback for detected packets
-    scanner.register_detection_callback(process_packet)
+    # Create the BLE scanner using bleak (bleak 1.0.1)
+    scanner = BleakScanner(detection_callback=process_packet)
     
     # Start scanning
     await scanner.start()
