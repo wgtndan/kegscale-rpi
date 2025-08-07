@@ -38,7 +38,7 @@ def process_packet(device, advertisement_data):
             "service_data": {k: v.hex() for k, v in advertisement_data.service_data.items()},
             "manufacturer_data": {k: v.hex() for k, v in advertisement_data.manufacturer_data.items()},
             "local_name": advertisement_data.local_name,
-            "tx_power": advertisement_data.tx_power,
+            # "tx_power": advertisement_data.tx_power,
         }
         
         # Print detailed info
@@ -53,8 +53,8 @@ def process_packet(device, advertisement_data):
             print(f"🏭 Manufacturer Data: {data['manufacturer_data']}")
         if data['local_name']:
             print(f"✏️ Local Name: {data['local_name']}")
-        if data['tx_power'] is not None:
-            print(f"📡 TX Power: {data['tx_power']}dBm")
+        # if data['tx_power'] is not None:
+        #     print(f"📡 TX Power: {data['tx_power']}dBm")
         print("-" * 50)
         
         # Save to Firebase
