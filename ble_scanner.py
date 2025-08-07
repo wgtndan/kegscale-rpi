@@ -13,11 +13,15 @@ db = firestore.client()
 # === Firebase Collections ===
 success_collection = db.collection("ble_scans")
 failure_collection = db.collection("ble_errors")
+status_collection = db.collection("status_messages")
 
 TARGET_TLM_UUID = "E4BE"  # Eddystone TLM frame UUID
 TARGET_UID_UUID = "FEAA"  # Eddystone UID frame UUID
 
+beacon_count = {}
+
 def process_packet(device, advertisement_data):
+    global beacon_count
     try:
         # Check if the advertisement contains Eddystone TLM or UID frame
         service_uuids = advertisement_data.get("service_uuids", [])
@@ -74,6 +78,9 @@ def process_packet(device, advertisement_data):
                 }
                 success_collection.add(doc)
 
+        # Increment beacon count by device address
+        beacon_count[device.address] = beacon_count.get(device.address, 0) + 1
+
     except Exception as e:
         now = datetime.utcnow().isoformat() + "Z"
         print(f"⚠️ Error processing packet: {str(e)}")
@@ -102,14 +109,37 @@ def decode_uid(advertisement_data):
         return namespace, instance
     return None
 
+async def status_update():
+    """Every 60 seconds, log the status with beacon count."""
+    while True:
+        try:
+            now = datetime.utcnow().isoformat() + "Z"
+            status_message = {
+                "timestamp": now,
+                "message": "Status update",
+                "beacon_count": beacon_count
+            }
+            status_collection.add(status_message)
+            print(f"📊 Status Update: {beacon_count}")
+        except Exception as e:
+            print(f"⚠️ Error logging status update: {str(e)}")
+        await asyncio.sleep(60)
+
 async def main():
     print("🔍 Listening for BLE advertisements...")
     
     # Create the BLE scanner using bleak
     scanner = BleakScanner()
 
+    # Attach the process_packet function to handle detected advertisements
+    scanner.register_detection_callback(process_packet)
+
     # Start scanning for Eddystone frames
     await scanner.start()
+    
+    # Run status update in the background
+    asyncio.create_task(status_update())
+
     try:
         while True:
             await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
