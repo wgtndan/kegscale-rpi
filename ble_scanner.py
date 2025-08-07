@@ -60,4 +60,62 @@ def process_packet(device, advertisement_data):
                 # Log the data for UID frame
                 hex_data = binascii.hexlify(advertisement_data.get("raw_data")).decode().upper()
                 now = datetime.utcnow().isoformat() + "Z"
-                print(f"📡 {peer_address} | {device_na
+                print(f"📡 {peer_address} | {device_name} | UID Frame | Namespace: {namespace} | Instance: {instance} | RSSI: {rssi}")
+                
+                # Add data to Firebase
+                doc = {
+                    "timestamp": now,
+                    "device_address": peer_address,
+                    "device_name": device_name,
+                    "namespace": namespace,
+                    "instance": instance,
+                    "rssi": rssi,
+                    "service_data_raw": hex_data
+                }
+                success_collection.add(doc)
+
+    except Exception as e:
+        now = datetime.utcnow().isoformat() + "Z"
+        print(f"⚠️ Error processing packet: {str(e)}")
+        failure_collection.add({
+            "timestamp": now,
+            "error": str(e)
+        })
+
+def decode_tlm(advertisement_data):
+    """Decode the Eddystone TLM frame"""
+    # Assuming the TLM frame contains the battery and temperature at fixed positions
+    service_data = advertisement_data.get("service_data", {}).get(TARGET_TLM_UUID, [])
+    if len(service_data) >= 6:
+        battery_level = service_data[2]  # Byte 2 is battery level (as an example)
+        temperature = (service_data[3] << 8) + service_data[4]  # Temperature data (just an example)
+        return battery_level, temperature
+    return None
+
+def decode_uid(advertisement_data):
+    """Decode the Eddystone UID frame"""
+    # Extract the namespace and instance from the UID frame (example positions)
+    service_data = advertisement_data.get("service_data", {}).get(TARGET_UID_UUID, [])
+    if len(service_data) >= 20:
+        namespace = service_data[2:10]  # Namespace is from byte 2 to 9
+        instance = service_data[10:18]  # Instance is from byte 10 to 17
+        return namespace, instance
+    return None
+
+async def main():
+    print("🔍 Listening for BLE advertisements...")
+    
+    # Create the BLE scanner using bleak
+    scanner = BleakScanner()
+
+    # Start scanning for Eddystone frames
+    await scanner.start()
+    try:
+        while True:
+            await asyncio.sleep(3600)  # Keep the service alive for 1 hour (or however long you need)
+    except KeyboardInterrupt:
+        print("🔚 Stopping scanner.")
+        await scanner.stop()  # Stop the scanner gracefully
+
+if __name__ == "__main__":
+    asyncio.run(main())
