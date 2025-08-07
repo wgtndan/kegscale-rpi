@@ -30,12 +30,12 @@ def process_packet(device, advertisement_data):
             "timestamp": now,
             "address": device.address or "Unknown",
             "name": device.name or "Unknown",
-            # "rssi": device.rssi,
+            "rssi": advertisement_data.rssi,
             "service_uuids": str(advertisement_data.service_uuids) or [''],
             "service_data": str({k: v.hex() for k, v in advertisement_data.service_data.items()}) or {'nothing': 'N/A'},
             "manufacturer_data": str({k: v.hex() for k, v in advertisement_data.manufacturer_data.items()}) or {'nothing': 'N/A'},
             "local_name": advertisement_data.local_name or "N/A",
-            # "tx_power": advertisement_data.tx_power,
+            "tx_power": advertisement_data.tx_power,
             "device": str(device),
             "advertisement": str(advertisement_data) or "N/A"
         }
