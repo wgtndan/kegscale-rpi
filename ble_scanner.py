@@ -100,15 +100,14 @@ async def main():
     scanner = BleakScanner(detection_callback=process_packet)
     
     try:
-        # Start scanning first
-        await scanner.start()
+        # # Start scanning first
+        # await scanner.start()
         
-        # Create status update task
-        status_task = asyncio.create_task(status_update())
+        # # Create status update task
+        # status_task = asyncio.create_task(status_update())
+
+        await status_update()
         
-        # Wait forever or until interrupted
-        while True:
-            await asyncio.sleep(1)
             
     except KeyboardInterrupt:
         print("🔚 Stopping scanner.")
