@@ -142,7 +142,7 @@ async def main():
                 f"  rssi={adv.rssi:3d}dBm  batt={d.battery_pct:2d}%  "
                 f"{'ACCEL' if d.accelerated else 'idle'}")
 
-        if args.print-raw and dump_counter < 10:
+        if args.print_raw and dump_counter < 10:
             # Show the two bytes we use for raw
             raw_b12 = payload[12]
             raw_b13 = payload[13]
