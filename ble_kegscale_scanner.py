@@ -1,180 +1,220 @@
 #!/usr/bin/env python3
-import asyncio
+"""
+kegscale_scanner.py
+-------------------
+BLE scanner for the E4BE keg scale beacons with decoding of:
+- Accelerated flag (button-press fast advertising)
+- Battery percentage
+- Temperature (°C)
+- Sequence/counter
+- Weight raw (u16) + placeholder linear calibration to kg
+- State/range code (u16)
+
+Tested with Bleak 1.0+ on Raspberry Pi (Linux).
+
+Usage:
+  python3 kegscale_scanner.py
+  python3 kegscale_scanner.py --mac 5C:01:3B:35:92:EE
+  python3 kegscale_scanner.py --log-file beacons.ndjson
+
+Install:
+  pip3 install bleak
+
+Notes:
+- We filter by the custom service UUID "0000e4be-0000-1000-8000-00805f9b34fb".
+- The payload for this UUID has been observed as 17 bytes long.
+- If you need systemd service, wrap this script and handle stdout/stderr as needed.
+"""
+
 import argparse
-import binascii
+import asyncio
 import json
 import sys
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
-from bleak import BleakScanner
+from bleak import BleakScanner, AdvertisementData
 
-# 16-bit Service UUID we're targeting
-SERVICE_UUID_16 = 0xE4BE
-# Convert to the 128-bit UUID string representation used by BlueZ/Bleak for 16-bit service data
-SERVICE_UUID_128 = f"0000{SERVICE_UUID_16:04x}-0000-1000-8000-00805f9b34fb"
+E4BE_UUID = "0000e4be-0000-1000-8000-00805f9b34fb"
 
 
-def decode_service_data(payload: bytes) -> dict:
+@dataclass
+class WeightCal:
+    """Linear calibration: kg = a * raw + b"""
+    a: float = 0.0
+    b: float = 0.0
+
+
+@dataclass
+class DecodedFrame:
+    accelerated: bool
+    battery_pct: int
+    temp_c: float
+    seq: int
+    weight_raw_u16: int
+    state_code_u16: int
+    checksum_u8: int
+    raw_hex: str
+
+
+def _u16be(b: bytes) -> int:
+    return (b[0] << 8) | b[1]
+
+
+def _u32be(b: bytes) -> int:
+    return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
+
+
+def decode_payload(payload: bytes) -> DecodedFrame:
     """
-    Best-current-knowledge decoder for the custom service data (UUID 0xE4BE).
+    Decode the 17-byte service data payload we've characterized.
 
-    Layout hypothesis (indexing starts at 0, *after* the 2-byte UUID that nRF Connect already strips):
-      [0]   flags/status?         (u8)      -> left as raw
-      [1]   sequence / frame id?  (u8)      -> left as raw
-      [2]   battery_raw           (u8)      -> mapped ~0-100% (see below)
-      [3:5] unknown_1             (u16 LE)  -> left as raw
-      [5:7] temperature_ddec_c    (u16 LE)  -> Temperature in deci-degC (e.g., 233 -> 23.3°C)
-      [7:8] reserved?             (u8)      -> left as raw
-      [8:10] weight_g             (u16 LE)  -> Weight in grams (hypothesis)
-      [10:12] unknown_2           (u16 LE)
-      [12:14] unknown_3           (u16 LE)
-      [14:16] unknown_4           (u16 LE)
-      [16]   status_2?            (u8)
-
-    NOTE: This is intentionally lenient. If the payload is shorter, fields will be missing.
+    Byte layout (0-indexed):
+      0: flags/frame (0x20 normal, 0x21 accelerated -> bit0 = accelerated)
+      1: 0x00 (reserved)
+      2: subtype/status (often 0x0F)
+      3: battery % (0..100)
+      4: temp_hi/status nibble (often 0x02)
+      5: temp_lo as deci-C (e.g., 0xDA -> 21.8°C)
+      6..9: u32 counter/sequence (big-endian)
+      10..11: padding/reserved (often zeros)
+      12..13: weight_raw candidate (u16 big-endian) -> correlates with app kg
+      14..15: state/range code (u16 big-endian) -> e.g., 0x0101, 0x0102
+      16: checksum/status (u8) (TBD)
     """
-    out = {"raw_hex": payload.hex()}
+    if len(payload) != 17:
+        raise ValueError(f"Expected 17-byte payload, got {len(payload)}")
 
-    def le16(b: bytes, start: int):
-        if len(b) >= start + 2:
-            return int.from_bytes(b[start:start+2], "little")
+    b = payload
+    accelerated = bool(b[0] & 0x01)
+    battery_pct = b[3]
+    temp_c = b[5] / 10.0  # empirically observed
+    seq = _u32be(b[6:10])
+    weight_raw_u16 = _u16be(b[12:14])
+    state_code_u16 = _u16be(b[14:16])
+    checksum_u8 = b[16]
+
+    return DecodedFrame(
+        accelerated=accelerated,
+        battery_pct=battery_pct,
+        temp_c=temp_c,
+        seq=seq,
+        weight_raw_u16=weight_raw_u16,
+        state_code_u16=state_code_u16,
+        checksum_u8=checksum_u8,
+        raw_hex=payload.hex(),
+    )
+
+
+def apply_weight_calibration(raw: int, cal: WeightCal | None) -> float | None:
+    """Convert weight_raw to kg using a simple linear model if provided."""
+    if cal is None:
         return None
-
-    def u8(b: bytes, idx: int):
-        if len(b) > idx:
-            return b[idx]
-        return None
-
-    # raw bytes for debugging/telemetry
-    out["len"] = len(payload)
-
-    out["flags"] = u8(payload, 0)
-    out["frame"] = u8(payload, 1)
-
-    batt_raw = u8(payload, 2)
-    out["battery_raw"] = batt_raw
-    if batt_raw is not None:
-        # Working guess: 0..21 ~ 0..100% (based on 0x0F ≈ 70%). Clamp 0..21 to avoid >100.
-        out["battery_pct_guess"] = round(min(batt_raw, 21) / 21 * 100)
-
-    out["unknown_1"] = le16(payload, 3)
-
-    temp_ddec = le16(payload, 5)
-    out["temperature_deci_c"] = temp_ddec
-    if temp_ddec is not None:
-        out["temperature_c"] = round(temp_ddec / 10.0, 1)
-
-    out["reserved_0x7"] = u8(payload, 7)
-
-    weight_g = le16(payload, 8)
-    out["weight_g"] = weight_g
-    if weight_g is not None:
-        out["weight_kg"] = round(weight_g / 1000.0, 3)
-        out["weight_lb"] = round(weight_g * 0.00220462, 3)
-
-    out["unknown_2"] = le16(payload, 10)
-    out["unknown_3"] = le16(payload, 12)
-    out["unknown_4"] = le16(payload, 14)
-    out["status_2"] = u8(payload, 16)
-
-    return out
+    return cal.a * raw + cal.b
 
 
-async def run(adapter: str, duration: float, once: bool, csv_path: str | None):
-    # Prepare CSV if requested
-    csv_file = None
-    if csv_path:
-        import csv
-        csv_file = open(csv_path, "a", newline="")
-        csv_writer = csv.writer(csv_file)
-        # header (only if file is empty)
-        if csv_file.tell() == 0:
-            csv_writer.writerow([
-                "ts_iso", "mac", "rssi", "raw_hex",
-                "battery_pct_guess", "temperature_c",
-                "weight_g", "weight_kg", "weight_lb"
-            ])
+def ndjson_dump(fp, obj: dict):
+    fp.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    fp.flush()
 
-    # Event to stop when --once is used
-    stop_event = asyncio.Event()
 
-    def detection_callback(device, advertisement_data):
-        # Filter only packets that include our Service Data UUID
-        sd = advertisement_data.service_data or {}
-        payload = sd.get(SERVICE_UUID_128)
+async def main():
+    parser = argparse.ArgumentParser(description="Scan and decode keg scale E4BE beacons.")
+    parser.add_argument("--mac", help="Filter for a specific MAC (case-insensitive).")
+    parser.add_argument("--uuid", default=E4BE_UUID, help="Service UUID to parse (default: E4BE).")
+    parser.add_argument("--log-file", help="Write NDJSON lines to this file.")
+    parser.add_argument("--print-raw", action="store_true", help="Include raw Bleak advertisement fields in stdout.")
+    parser.add_argument("--cal-a", type=float, default=None, help="Weight calibration slope a (kg per raw).")
+    parser.add_argument("--cal-b", type=float, default=None, help="Weight calibration intercept b (kg at raw=0).")
+    args = parser.parse_args()
+
+    mac_filter = args.mac.upper() if args.mac else None
+    cal = None
+    if args.cal_a is not None and args.cal_b is not None:
+        cal = WeightCal(a=args.cal_a, b=args.cal_b)
+
+    log_fp = open(args.log_file, "a", buffering=1) if args.log_file else None
+
+    def detection_callback(device, adv: AdvertisementData):
+        # Filter MAC if requested
+        if mac_filter and (device.address or "").upper() != mac_filter:
+            return
+
+        # Grab service data payload for the UUID
+        payload = None
+        if adv.service_data and args.uuid in adv.service_data:
+            payload = adv.service_data[args.uuid]
+
         if not payload:
             return
 
-        ts = datetime.now(timezone.utc).isoformat()
-        decoded = decode_service_data(payload)
+        # Expect 17-byte payload
+        try:
+            decoded = decode_payload(payload)
+        except Exception as e:
+            # Ignore malformed
+            return
 
-        # Prefer RSSI from advertisement_data; fall back to device.metadata if missing
-        rssi = getattr(advertisement_data, "rssi", None)
-        rssi_source = "adv"
-        if rssi is None:
-            rssi = (getattr(device, "metadata", {}) or {}).get("rssi")
-            rssi_source = "device.metadata" if rssi is not None else "unknown"
-
+        # Assemble record
+        now = datetime.now(timezone.utc).isoformat()
         record = {
-            "ts_iso": ts,
+            "ts_iso": now,
             "mac": device.address,
-            "rssi": rssi,
-            "rssi_source": rssi_source,
-            "uuid": SERVICE_UUID_128,
-            **decoded,
+            "rssi": adv.rssi,
+            "rssi_source": "adv",
+            "uuid": args.uuid,
+            "raw_hex": decoded.raw_hex,
+            "len": len(payload),
+            "accelerated": decoded.accelerated,
+            "battery_pct": decoded.battery_pct,
+            "temperature_c": decoded.temp_c,
+            "seq": decoded.seq,
+            "weight_raw_u16": decoded.weight_raw_u16,
+            "weight_kg": apply_weight_calibration(decoded.weight_raw_u16, cal),
+            "state_code_u16": decoded.state_code_u16,
+            "checksum_u8": decoded.checksum_u8,
         }
 
-        # Print newline-delimited JSON (friendly for `jq` and log shippers)
-        print(json.dumps(record, ensure_ascii=False), flush=True)
+        # Print to stdout
+        print(json.dumps(record, separators=(",", ":")))
 
-        # Optionally append to CSV
-        if csv_path:
-            csv_writer.writerow([
-                ts,
-                device.address,
-                advertisement_data.rssi,
-                decoded.get("raw_hex"),
-                decoded.get("battery_pct_guess"),
-                decoded.get("temperature_c"),
-                decoded.get("weight_g"),
-                decoded.get("weight_kg"),
-                decoded.get("weight_lb"),
-            ])
-            csv_file.flush()
+        # And to file if requested
+        if log_fp:
+            ndjson_dump(log_fp, record)
 
-        if once:
-            stop_event.set()
+        # Optionally dump raw advertisement fields (debug)
+        if args.print_raw:
+            dbg = {
+                "local_name": adv.local_name,
+                "service_uuids": adv.service_uuids,
+                "tx_power": adv.tx_power,
+                "manufacturer_data": {
+                    k: v.hex() if isinstance(v, (bytes, bytearray)) else v
+                    for k, v in (adv.manufacturer_data or {}).items()
+                },
+            }
+            sys.stderr.write(json.dumps(dbg, indent=2) + "\n")
 
-    scanner = BleakScanner(detection_callback, adapter=adapter)
+    # Use BleakScanner with detection callback (Bleak 1.0+ API)
+    scanner = BleakScanner(detection_callback=detection_callback, service_uuids=[args.uuid])
 
-    await scanner.start()
+    print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
     try:
-        if once:
-            await stop_event.wait()
-        else:
-            await asyncio.sleep(duration)
-    finally:
-        await scanner.stop()
-        if csv_file:
-            csv_file.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scan BLE advertisements for Service Data 0xE4BE and decode payloads."
-    )
-    parser.add_argument("--hci", dest="adapter", default="hci0", help="HCI adapter (default: hci0)")
-    parser.add_argument("--duration", type=float, default=60.0, help="How long to run in seconds (ignored with --once)")
-    parser.add_argument("--once", action="store_true", help="Stop after first matching packet")
-    parser.add_argument("--csv", dest="csv_path", default=None, help="Append decoded rows to this CSV file")
-
-    args = parser.parse_args()
-
-    try:
-        asyncio.run(run(args.adapter, args.duration, args.once, args.csv_path))
+        await scanner.start()
+        while True:
+            await asyncio.sleep(0.3)
     except KeyboardInterrupt:
         pass
+    finally:
+        await scanner.stop()
+        if log_fp:
+            log_fp.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        # In case of event loop already running (rare), fallback
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
