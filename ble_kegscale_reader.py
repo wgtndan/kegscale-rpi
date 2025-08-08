@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""
-ble_kegscale_reader.py
-----------------------
-Lightweight BLE reader for your keg scale beacons.
-
-Decoding:
-- Weight raw field = bytes 12..13 (u16 big-endian) from the 17-byte service data.
-- Weight (kg) computed via linear model: kg = slope * raw + intercept.
-  Defaults come from your fit:
-      slope    = -0.00169562
-      intercept=  37.41647250
-- Negative slope is expected (raw decreases as mass increases).
-
-Extras:
-- --smooth N: rolling average of raw before applying model (default 7).
-- --zero: capture first computed kg as baseline and print zeroed_kg = kg - kg0.
-- Clean, single-line status output. Optional NDJSON logging.
-
-Examples:
-  # Just read with defaults
-  python3 ble_kegscale_reader.py --mac 5C:01:3B:35:92:EE
-
-  # Zero at start and smooth more
-  python3 ble_kegscale_reader.py --mac 5C:01:3B:35:92:EE --zero --smooth 10
-
-  # Override model
-  python3 ble_kegscale_reader.py --mac 5C:01:3B:35:92:EE --slope -0.00170 --intercept 37.50
-"""
-
 import argparse
 import asyncio
 import json
@@ -43,7 +14,6 @@ from bleak import BleakScanner, AdvertisementData
 E4BE_UUID_128 = "0000e4be-0000-1000-8000-00805f9b34fb"
 E4BE_UUID_16  = "e4be"
 
-
 @dataclass
 class Decoded:
     accelerated: bool
@@ -54,24 +24,24 @@ class Decoded:
     checksum_u8: int
     raw_hex: str
 
-
 def _u16be(b: bytes) -> int:
     return (b[0] << 8) | b[1]
 
-
 def _u32be(b: bytes) -> int:
     return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
-
 
 def decode(payload: bytes) -> Decoded:
     if len(payload) != 17:
         raise ValueError(f"expected 17B payload, got {len(payload)}")
     b = payload
-    accelerated = bool(b[0] & 0x01)   # 0x20 normal, 0x21 accelerated
+    # sanity: byte0 is flags: 0x20 normal, 0x21 accelerated
+    accel_flag = b[0]
+    accelerated = (accel_flag & 0x01) == 0x01
     battery_pct = b[3]
+    # TEMP: we don't fully trust the position; keep it as b[5]/10 for display only
     temperature_c = b[5] / 10.0
     seq_u32 = _u32be(b[6:10])
-    raw12_13 = _u16be(b[12:14])       # <-- weight raw
+    raw12_13 = _u16be(b[12:14])       # weight raw
     checksum_u8 = b[16]
     return Decoded(
         accelerated=accelerated,
@@ -83,36 +53,43 @@ def decode(payload: bytes) -> Decoded:
         raw_hex=payload.hex(),
     )
 
+def looks_like_e4be(payload: bytes) -> bool:
+    if len(payload) != 17:
+        return False
+    b0 = payload[0]
+    return b0 in (0x20, 0x21)  # observed flags
 
 def find_payload(adv: AdvertisementData, want_uuid: Optional[str], debug: bool=False) -> Optional[bytes]:
     if not adv.service_data:
         return None
-
-    candidates = []
     want = (want_uuid or "").lower()
 
+    # 1) Strict UUID match first
     for key, val in adv.service_data.items():
         k = str(key).lower()
-        if want:
-            if k == want or k.endswith(want) or want.endswith(k):
-                if isinstance(val, (bytes, bytearray)) and len(val) == 17:
-                    return bytes(val)
-        # fallback match on the known UUIDs
-        if k == E4BE_UUID_128 or k.endswith(E4BE_UUID_128) or k == E4BE_UUID_16 or k.endswith(E4BE_UUID_16):
+        if want and (k == want or k.endswith(want) or want.endswith(k)):
             if isinstance(val, (bytes, bytearray)) and len(val) == 17:
-                candidates.append(bytes(val))
+                b = bytes(val)
+                if looks_like_e4be(b):
+                    return b
 
-    if candidates:
-        return candidates[0]
+    # 2) Fuzzy match on known 'e4be' keys
+    for key, val in adv.service_data.items():
+        k = str(key).lower()
+        if ("e4be" in k) and isinstance(val, (bytes, bytearray)) and len(val) == 17:
+            b = bytes(val)
+            if looks_like_e4be(b):
+                return b
 
-    # final fallback: any 17B service_data blob
-    for v in adv.service_data.values():
-        if isinstance(v, (bytes, bytearray)) and len(v) == 17:
-            if debug:
-                sys.stderr.write("⚠️  Using 17-byte fallback (no UUID key match)\n")
-            return bytes(v)
+    # 3) As a last resort, scan any 17B blob but require the flags sanity
+    for val in adv.service_data.values():
+        if isinstance(val, (bytes, bytearray)) and len(val) == 17:
+            b = bytes(val)
+            if looks_like_e4be(b):
+                if debug:
+                    sys.stderr.write("⚠️  Using fallback 17B block that passes flags check\n")
+                return b
     return None
-
 
 async def main():
     ap = argparse.ArgumentParser(description="BLE kegscale reader with linear weight model and smoothing.")
@@ -123,6 +100,7 @@ async def main():
     ap.add_argument("--slope", type=float, default=-0.00169562, help="Model slope (kg per raw count).")
     ap.add_argument("--intercept", type=float, default=37.41647250, help="Model intercept (kg).")
     ap.add_argument("--log-file", help="Write NDJSON to this file.")
+    ap.add_argument("--print-raw", action="store_true", help="Also print raw_hex and bytes[12:14] for the first few packets.")
     ap.add_argument("--debug", action="store_true", help="Extra diagnostics to stderr.")
     args = ap.parse_args()
 
@@ -132,20 +110,11 @@ async def main():
     zero_kg: Optional[float] = None
     log_fp = open(args.log_file, "a", buffering=1) if args.log_file else None
 
-    def fmt_line(ts, kg, kg0, raw, rssi, temp, accel, batt):
-        if kg is None:
-            wtxt = "kg=…"
-            ztxt = "zeroed=…"
-        else:
-            wtxt = f"kg={kg:7.3f}"
-            ztxt = f" zeroed={kg-kg0:7.3f}" if (args.zero and kg0 is not None) else ""
-        return (f"{ts}  {wtxt}{ztxt}  raw={raw:5d}  temp={temp:4.1f}°C  "
-                f"rssi={rssi:3d}dBm  batt={batt:2d}%  {'ACCEL' if accel else 'idle'}")
+    dump_counter = 0
 
     def detection_callback(device, adv: AdvertisementData):
-        nonlocal zero_kg
+        nonlocal zero_kg, dump_counter
 
-        # MAC filter
         if mac_filter and ((device.address or "").upper() != mac_filter):
             return
 
@@ -162,18 +131,27 @@ async def main():
 
         raw_buf.append(d.raw12_13)
         raw_smoothed = int(round(mean(raw_buf))) if raw_buf else d.raw12_13
-
         kg = args.slope * float(raw_smoothed) + args.intercept
-
         if args.zero and zero_kg is None:
             zero_kg = kg
 
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        line = fmt_line(now, kg, zero_kg, raw_smoothed, adv.rssi, d.temperature_c, d.accelerated, d.battery_pct)
-        # pretty single-line update
-        print("\r" + line, end="", flush=True)
+        base = (f"{now}  kg={kg:7.3f}"
+                f"{(f' zeroed={kg-zero_kg:7.3f}' if (args.zero and zero_kg is not None) else '')}"
+                f"  raw={raw_smoothed:5d}  temp={d.temperature_c:4.1f}°C"
+                f"  rssi={adv.rssi:3d}dBm  batt={d.battery_pct:2d}%  "
+                f"{'ACCEL' if d.accelerated else 'idle'}")
 
-        # NDJSON log (one per packet)
+        if args.print-raw and dump_counter < 10:
+            # Show the two bytes we use for raw
+            raw_b12 = payload[12]
+            raw_b13 = payload[13]
+            extra = f"  raw_hex={d.raw_hex}  b12={raw_b12:#04x} b13={raw_b13:#04x}"
+            print(base + extra)
+            dump_counter += 1
+        else:
+            print(base)
+
         if log_fp:
             rec = {
                 "ts_iso": now,
@@ -199,12 +177,11 @@ async def main():
                 "local_name": adv.local_name,
                 "service_uuids": adv.service_uuids,
                 "tx_power": adv.tx_power,
-                "manufacturer_data_keys": list((adv.manufacturer_data or {}).keys()),
+                "service_data_keys": list(adv.service_data.keys()) if adv.service_data else [],
             }
-            sys.stderr.write("\n" + json.dumps(dbg) + "\n")
+            sys.stderr.write(json.dumps(dbg) + "\n")
 
     scanner = BleakScanner(detection_callback=detection_callback)
-
     print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
     try:
         await scanner.start()
@@ -216,14 +193,11 @@ async def main():
         await scanner.stop()
         if log_fp:
             log_fp.close()
-        print()  # newline after last status line
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except RuntimeError:
-        # If already in an event loop
         import asyncio as _asyncio
         loop = _asyncio.get_event_loop()
         loop.run_until_complete(main())
