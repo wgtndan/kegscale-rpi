@@ -1,284 +1,330 @@
+
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BLE Keg Scale Reader & Calibrator
+- Filters BLE adverts for a device broadcasting Service Data under UUID E4BE
+- Parses raw reading from bytes 12-13 (configurable endian), temp & batt from service data
+- Median smoothing on RAW, stability gate before committing displayed kg
+- Two-point calibration + optional temp compensation
+- Persisted config & calibration in JSON
+
+Tested with Python 3.11 and bleak 1.x on Raspberry Pi.
+"""
+
 import argparse
 import asyncio as _asyncio
+from contextlib import suppress
 import json
-import signal
-import statistics
-import sys
-import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, Deque, Tuple, List
+import statistics as stats
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 from bleak import BleakScanner
 
-SERVICE_UUID = "0000e4be-0000-1000-8000-00805f9b34fb"  # custom service in ADV service_data
+DEFAULT_SERVICE_UUID = "0000e4be-0000-1000-8000-00805f9b34fb"
 
-# ---------------------------
-# Parsing / math helpers
-# ---------------------------
-
-@dataclass
-class Packet:
-    ts: float
-    raw_hex: str
-    payload: bytes
-    flags: int
-    batt_raw: int
-    temp_deci_c: int
-    weight_raw_u16: int   # << NEW: bytes 8-9 LE
-    seq_u16_le: int       # suspected timer/seq: bytes 12-13 LE
-    seq_u16_be: int       # bytes 12-13 BE
-    accel: bool
-
-def parse_payload(raw_hex: str) -> Optional[Packet]:
-    try:
-        b = bytes.fromhex(raw_hex)
-    except Exception:
-        return None
-    if len(b) < 17:
-        return None
-
-    flags = b[0]
-    accel = bool(flags & 0x01)  # bit0 toggles in your logs
-
-    batt_raw = b[2]            # app seems ~67% when this byte ~15 and max ~22
-    temp_deci_c = b[5]         # deci°C (18 -> 1.8°C? Your device looks like 188=18.8; but logs show 0x0f3c?)
-    # In samples you posted, temp was b[5]==0x3c? Those were earlier firmwares.
-    # Recent lines show temp toggling via b[5]==0x40 (64 deciC=6.4). We'll keep b[5] as deci C like before.
-
-    # --- KEY CHANGE: weight source ---
-    # Weight is the u16 little-endian at offsets 8-9.
-    # Your dumps: ... 0000 [05 bb] 0001 [35 17] ...
-    #  - 0x05BB moves with load, not monotonic with time.
-    #  - 0x3517 monotonic timer -> not weight.
-    weight_raw_u16 = b[8] | (b[9] << 8)  # LE
-
-    # Keep the former suspect as seq for debugging (bytes 12-13).
-    seq_le = b[12] | (b[13] << 8)
-    seq_be = (b[12] << 8) | b[13]
-
-    return Packet(
-        ts=time.time(),
-        raw_hex=raw_hex,
-        payload=b,
-        flags=flags,
-        batt_raw=batt_raw,
-        temp_deci_c=temp_deci_c,
-        weight_raw_u16=weight_raw_u16,
-        seq_u16_le=seq_le,
-        seq_u16_be=seq_be,
-        accel=accel,
-    )
-
-@dataclass
-class Cal:
-    slope: float   # kg per raw unit
-    intercept: float  # kg
-
-    def to_json(self):
-        return {"slope": self.slope, "intercept": self.intercept}
-
-    @staticmethod
-    def from_json(d):
-        return Cal(float(d["slope"]), float(d["intercept"]))
-
-
-# ---------------------------
-# Live scanner
-# ---------------------------
 
 def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-def fmt_batt_pct(b_raw: int, batt_max: int) -> int:
-    pct = int(round(100 * max(0, min(b_raw, batt_max)) / batt_max))
-    return pct
 
-class StopSignal(Exception):
-    pass
+def clip(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
-async def stream_packets(mac_filter: Optional[str], uuid: str, queue: _asyncio.Queue, debug=False):
-    mac_norm = mac_filter.lower() if mac_filter else None
 
-    def cb(device, adv):
-        if mac_norm and device.address.lower() != mac_norm:
+def parse_service_data(sd: bytes, *, endian: str, dump_u16: bool = False) -> Dict[str, Any]:
+    """Parse fields we currently understand from the service data payload.
+    Layout (best current guess):
+      byte 2   -> batt_raw (0-255) (often ~0x0F observed)
+      bytes 5-6 -> temperature in deci-°C (little-endian, signed) -> temp_c = /10
+      bytes 12-13 -> RAW reading (configurable endian)
+    """
+    if sd is None or len(sd) < 14:
+        raise ValueError(f"service_data too short: {None if sd is None else len(sd)} bytes" )
+
+    batt_raw = sd[2]
+
+    # temperature: signed little-endian deci-degC (observed)
+    temp_raw_le = int.from_bytes(sd[5:7], byteorder="little", signed=True)
+    temp_c = temp_raw_le / 10.0
+
+    if endian not in ("little", "big"):
+        raise ValueError("endian must be 'little' or 'big'")
+    raw = int.from_bytes(sd[12:14], byteorder=endian, signed=False)
+
+    out = {
+        "batt_raw": batt_raw,
+        "temp_raw": temp_raw_le,
+        "temp_c": temp_c,
+        "raw": raw,
+        "b12": sd[12],
+        "b13": sd[13],
+    }
+
+    if dump_u16:
+        out["raw_le"] = int.from_bytes(sd[12:14], byteorder="little", signed=False)
+        out["raw_be"] = int.from_bytes(sd[12:14], byteorder="big", signed=False)
+
+    return out
+
+
+def map_temp(temp_c: float, temp_map: Optional[Dict[str, float]]) -> float:
+    if not temp_map:
+        return temp_c
+    a = temp_map.get("a", 1.0)
+    b = temp_map.get("b", 0.0)
+    return a * temp_c + b
+
+
+def map_batt(batt_raw: int, batt_map: Optional[Dict[str, float]]) -> int:
+    if not batt_map:
+        # Fallback heuristic - scale 0..15 -> 0..100%
+        if batt_raw <= 0x0F:
+            pct = int(round((batt_raw / 15.0) * 100.0))
+        else:
+            pct = int(round((batt_raw / 255.0) * 100.0))
+        return clip(pct, 0, 100)
+    a = batt_map.get("a", 6.67)  # if batt_raw in 0..15, ~6.67 per step
+    b = batt_map.get("b", 0.0)
+    pct = int(round(a * batt_raw + b))
+    return clip(pct, 0, 100)
+
+
+def stable(buf: deque, s_thresh: float, slope_thresh: float) -> bool:
+    if len(buf) < buf.maxlen:
+        return False
+    # population stdev over raw counts
+    sd = stats.pstdev(buf)
+    slope = (buf[-1] - buf[0]) / max(1, len(buf) - 1)
+    return sd < s_thresh and abs(slope) < slope_thresh
+
+
+async def run_scanner(callback, scan_time: float = None):
+    """Start a BleakScanner with a detection callback. If scan_time is provided,
+    run for that many seconds; else run until cancelled from outside."""
+    async with BleakScanner(detection_callback=callback) as scanner:
+        if scan_time is None:
+            # Run indefinitely; caller should cancel task
+            while True:
+                await _asyncio.sleep(3600)
+        else:
+            await _asyncio.sleep(scan_time)
+    return
+
+
+async def collect_mean_raw(target_mac: Optional[str], target_uuid: str, *, seconds: float, endian: str,
+                           debug: bool = False) -> int:
+    """Collect raw readings for 'seconds' and return integer mean of raw."""
+    target_mac_norm = target_mac.replace(":", "").lower() if target_mac else None
+    raws = []
+
+    def on_detect(device, adv):
+        nonlocal raws
+        mac_norm = device.address.replace(":", "").lower()
+        if target_mac_norm and mac_norm != target_mac_norm:
             return
-        sd = adv.service_data or {}
-        data = sd.get(uuid)
-        if not data:
+        sd_dict = adv.service_data or {}
+        sd = sd_dict.get(target_uuid)
+        if not sd:
             return
-        raw_hex = data.hex()
-        pkt = parse_payload(raw_hex)
-        if not pkt:
+        try:
+            fields = parse_service_data(sd, endian=endian, dump_u16=False)
+            raws.append(fields["raw"])
+            if debug:
+                print(f"[collect] raw={fields['raw']} b12=0x{fields['b12']:02x} b13=0x{fields['b13']:02x}")
+        except Exception as e:
+            if debug:
+                print(f"[collect] parse error: {e}")
+
+    task = _asyncio.create_task(run_scanner(on_detect, scan_time=seconds))
+    with suppress(Exception):
+        await task
+    if not raws:
+        raise RuntimeError("No samples captured during calibration window. Check MAC/UUID/endian.")
+    return int(round(sum(raws) / len(raws)))
+
+
+def load_cal(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_cal(path: str, cal: Dict[str, Any]):
+    p = Path(path)
+    p.write_text(json.dumps(cal, indent=2, sort_keys=True), encoding="utf-8")
+
+
+async def live_read(args):
+    cal = load_cal(args.load_cal or args.save_cal)
+    slope = cal.get("slope")
+    intercept = cal.get("intercept")
+    temp_map = cal.get("temp_map")
+    batt_map = cal.get("batt_map")
+    parser_meta = cal.get("parser", {})
+    if parser_meta:
+        # warn if mismatch in debug
+        if args.debug and (
+            parser_meta.get("endian") != args.endian
+            or parser_meta.get("raw_bytes") != [12, 13]
+            or parser_meta.get("uuid", DEFAULT_SERVICE_UUID) != args.uuid
+        ):
+            print("[warn] Parser settings differ from saved calibration; weights may be off.")
+
+    displayed_kg = 0.0
+    zero_offset = 0.0 if not args.zero else (0.0)  # maintained as kg after conversion
+    raw_buf = deque(maxlen=max(3, args.smooth))
+
+    def on_detect(device, adv):
+        nonlocal displayed_kg, zero_offset
+        if args.mac:
+            if device.address.replace(":", "").lower() != args.mac.replace(":", "").lower():
+                return
+        sd = (adv.service_data or {}).get(args.uuid)
+        if not sd:
             return
-        if debug:
-            # also expose advertisement meta quickly
-            pass
-        queue.put_nowait(pkt)
+        try:
+            fields = parse_service_data(sd, endian=args.endian, dump_u16=args.dump_u16)
 
-    scanner = BleakScanner(detection_callback=cb)
-    try:
-        await scanner.start()
-        while True:
-            await _asyncio.sleep(0.05)
-    finally:
-        await scanner.stop()
+            # derived mappings
+            temp_c_mapped = map_temp(fields["temp_c"], temp_map)
+            batt_pct = map_batt(fields["batt_raw"], batt_map)
 
-async def collect_mean_raw(mac_filter: Optional[str], uuid: str, seconds: float, debug=False) -> int:
-    q: _asyncio.Queue = _asyncio.Queue()
-    task = _asyncio.create_task(stream_packets(mac_filter, uuid, q, debug=debug))
-    t0 = time.time()
-    vals: List[int] = []
-    try:
-        while time.time() - t0 < seconds:
-            try:
-                pkt: Packet = await _asyncio.wait_for(q.get(), timeout=0.8)
-            except _asyncio.TimeoutError:
-                continue
-            vals.append(pkt.weight_raw_u16)
-    finally:
-        task.cancel()
-        with _asyncio.suppress(Exception):
-            await task
-    if not vals:
-        raise RuntimeError("No samples captured during calibration window.")
-    return int(round(statistics.mean(vals)))
+            # smoothing on RAW first
+            raw_buf.append(fields["raw"])
+            raw_med = stats.median(raw_buf)
 
-# ---------------------------
-# Main
-# ---------------------------
-
-def build_argparser():
-    ap = argparse.ArgumentParser(description="BLE keg scale reader (weight from bytes 8-9 LE).")
-    ap.add_argument("--mac", help="Filter to this MAC (recommended).")
-    ap.add_argument("--uuid", default=SERVICE_UUID, help="Service Data UUID to parse (default keg scale UUID).")
-    ap.add_argument("--smooth", type=int, default=1, help="Moving average window over weight_raw (packets).")
-    ap.add_argument("--zero", action="store_true", help="Print weight zeroed to first sample.")
-    ap.add_argument("--print-raw", action="store_true", help="Include raw_hex and byte hints.")
-    ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--dump-u16", action="store_true", help="Print u16 fields at [8,10,12,14] (LE/BE).")
-
-    # Battery/temp tweaks
-    ap.add_argument("--batt-max", type=int, default=22, help="Battery full-scale raw value (default 22).")
-    ap.add_argument("--temp-offset", type=float, default=0.0, help="Temperature additive offset in °C.")
-    # Calibration
-    ap.add_argument("--calibrate", type=float, nargs="?", const=1.13, help="Run two-step calibration with known mass (kg). Default 1.13 if no value given.")
-    ap.add_argument("--cal-seconds", type=float, default=3.0, help="Seconds to average for each cal step.")
-    ap.add_argument("--save-cal", help="File to save calibration JSON (slope/intercept).")
-    ap.add_argument("--load-cal", help="File to load calibration JSON.")
-    return ap
-
-def apply_cal(raw: int, cal: Optional[Cal]) -> Optional[float]:
-    if cal is None:
-        return None
-    return cal.slope * raw + cal.intercept
-
-async def run_live(args, cal: Optional[Cal]):
-    q: _asyncio.Queue = _asyncio.Queue()
-    task = _asyncio.create_task(stream_packets(args.mac, args.uuid, q, debug=args.debug))
-
-    # smoothing window
-    win: Deque[int] = deque(maxlen=max(1, args.smooth))
-    zero_offset: Optional[float] = None
-    dump_once = 0
-
-    try:
-        while True:
-            pkt: Packet = await q.get()
-
-            win.append(pkt.weight_raw_u16)
-            raw_avg = sum(win) / len(win)
-
-            kg = apply_cal(raw_avg, cal)
-            if args.zero:
-                if zero_offset is None and kg is not None:
-                    zero_offset = kg
-                kg_zero = (kg - zero_offset) if (kg is not None and zero_offset is not None) else None
+            if slope is not None and intercept is not None:
+                kg_now = slope * raw_med + intercept
+                if args.temp_comp and cal.get("temp_ref") is not None:
+                    kg_now -= cal.get("temp_coeff", 0.0) * (temp_c_mapped - cal.get("temp_ref", temp_c_mapped))
             else:
-                kg_zero = kg
+                kg_now = 0.0  # uncalibrated
 
-            batt_pct = fmt_batt_pct(pkt.batt_raw, args.batt_max)
-            temp_c = pkt.temp_deci_c / 10.0 + args.temp_offset
+            if args.zero:
+                if zero_offset == 0.0:
+                    zero_offset = kg_now
+                kg_zeroed = max(0.0, kg_now - zero_offset)
+            else:
+                kg_zeroed = kg_now
 
-            ts = datetime.fromtimestamp(pkt.ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
-            base = f"{ts}  kg={kg:6.3f}" if kg is not None else f"{ts}  kg=   n/a"
-            base += f" zeroed={kg_zero:6.3f}" if kg_zero is not None else " zeroed=   n/a"
-            base += f"  raw={int(raw_avg):5d}  temp={temp_c:.1f}°C  rssi=?dBm  batt={batt_pct}%"
-            base += "  ACCEL" if pkt.accel else "  idle"
+            # stability gate
+            commit = stable(raw_buf, s_thresh=args.stable_sd, slope_thresh=args.stable_slope)
 
-            dump_line = ""
+            if commit:
+                displayed_kg = kg_zeroed
+
             if args.print_raw:
-                b12 = pkt.payload[12] if len(pkt.payload) > 12 else 0
-                b13 = pkt.payload[13] if len(pkt.payload) > 13 else 0
-                dump_line += f"  raw_hex={pkt.raw_hex}  b12=0x{b12:02x} b13=0x{b13:02x}"
+                rssi = getattr(adv, "rssi", None)
+                idle = "idle"  # placeholder; you can compute accel if you later add it
+                tstamp = now_iso()
+                if args.debug:
+                    print(
+                        f"{tstamp}  kg={displayed_kg:.3f} zeroed={(kg_zeroed if args.zero else 0):.3f} "
+                        f"raw={int(raw_med)} temp={temp_c_mapped:.1f}°C rssi={rssi}dBm batt={batt_pct}%  "
+                        f"b12=0x{fields['b12']:02x} b13=0x{fields['b13']:02x} {idle}"
+                    )
+                else:
+                    print(
+                        f"{tstamp}  kg={displayed_kg:.3f} zeroed={(kg_zeroed if args.zero else 0):.3f} "
+                        f"raw={int(raw_med)}  temp={temp_c_mapped:.1f}°C  batt={batt_pct}%"
+                    )
 
-            if args.dump_u16:
-                b = pkt.payload
-                def u16le(i): return (b[i] | (b[i+1]<<8)) if i+1 < len(b) else None
-                def u16be(i): return ((b[i]<<8) | b[i+1]) if i+1 < len(b) else None
-                fields = []
-                for i in (8,10,12,14):
-                    le = u16le(i); be = u16be(i)
-                    fields.append(f"u16@{i}(le)={le:5d}" if le is not None else f"u16@{i}(le)=  N/A")
-                    fields.append(f"u16@{i}(be)={be:5d}" if be is not None else f"u16@{i}(be)=  N/A")
-                dump_line += "  [" + "  ".join(fields) + "]"
+        except Exception as e:
+            if args.debug:
+                print(f"[read] parse error: {e}")
 
-            print(base + ("" if not dump_line else "  " + dump_line))
-    finally:
-        task.cancel()
-        with _asyncio.suppress(Exception):
-            await task
+    # Run until Ctrl+C
+    print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
+    try:
+        await run_scanner(on_detect, scan_time=None)
+    except KeyboardInterrupt:
+        pass
+
+
+async def calibrate(args):
+    print("🧪 Calibration mode")
+    print("1) Leave the scale EMPTY and press Enter. I will average raw for a few seconds...")
+    input()
+    R0 = await collect_mean_raw(args.mac, args.uuid, seconds=args.cal_seconds, endian=args.endian, debug=args.debug)
+    print(f"   -> Empty mean raw = {R0}")
+
+    print(f"2) Place known mass ({args.calibrate:.3f} kg), wait for it to settle, then press Enter.")
+    input()
+    R1 = await collect_mean_raw(args.mac, args.uuid, seconds=args.cal_seconds, endian=args.endian, debug=args.debug)
+    print(f"   -> Loaded mean raw = {R1}")
+
+    if R1 == R0:
+        raise RuntimeError("Calibration failed: R1 equals R0; no delta.")
+
+    slope = float(args.calibrate) / float(R1 - R0)
+    intercept = -slope * R0
+
+    cal = load_cal(args.load_cal or args.save_cal)
+    cal.update({
+        "slope": slope,
+        "intercept": intercept,
+        "temp_ref": 20.0,
+        "temp_coeff": cal.get("temp_coeff", 0.0),
+        "parser": {
+            "endian": args.endian,
+            "raw_bytes": [12, 13],
+            "uuid": args.uuid,
+        },
+        # keep any existing mappings if present
+        "batt_map": cal.get("batt_map"),
+        "temp_map": cal.get("temp_map"),
+        "updated": now_iso(),
+    })
+
+    if args.save_cal:
+        save_cal(args.save_cal, cal)
+        print(f"✅ Saved calibration to {args.save_cal}")
+        print(json.dumps({k: cal[k] for k in ("slope","intercept","parser","updated")}, indent=2))
+
+    return cal
+
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(description="BLE Keg Scale Reader & Calibrator (E4BE)")
+    p.add_argument("--mac", help="Filter by MAC address (colon-separated or not)", default=None)
+    p.add_argument("--uuid", default=DEFAULT_SERVICE_UUID, help="Service UUID key containing the service data")
+    p.add_argument("--endian", choices=["little", "big"], default="little", help="Endian for raw bytes 12-13")
+    p.add_argument("--smooth", type=int, default=5, help="Median smoothing window (raw counts)")
+    p.add_argument("--zero", action="store_true", help="Start in zeroed (tare) mode")
+
+
+    p.add_argument("--print-raw", action="store_true", help="Print live rows of parsed output")
+    p.add_argument("--debug", action="store_true", help="Verbose debug including parse info")
+    p.add_argument("--dump-u16", action="store_true", help="Add raw_le/raw_be to parse (debug only)")
+
+    p.add_argument("--calibrate", type=float, default=None, help="Enter calibration mode with known mass (kg)")
+    p.add_argument("--cal-seconds", type=float, default=4.0, help="Seconds to average raw during each cal step")
+    p.add_argument("--save-cal", default="keg_cal.json", help="Path to save calibration JSON")
+    p.add_argument("--load-cal", default=None, help="Path to load calibration JSON (else will use --save-cal if exists)")
+
+    p.add_argument("--temp-comp", action="store_true", help="Enable temp compensation using JSON temp_coeff & temp_ref")
+    p.add_argument("--stable-sd", type=float, default=4.0, help="Stability gate: stdev threshold on raw counts")
+    p.add_argument("--stable-slope", type=float, default=1.5, help="Stability gate: absolute slope counts/step threshold")
+
+    return p
+
 
 async def main():
-    ap = build_argparser()
-    args = ap.parse_args()
+    args = build_arg_parser().parse_args()
 
-    # calibration modes
     if args.calibrate is not None:
-        print("🧪 Calibration mode")
-        input("1) Leave the scale EMPTY and press Enter. I will average raw for a few seconds...")
-        try:
-            R0 = await collect_mean_raw(args.mac, args.uuid, seconds=args.cal_seconds, debug=args.debug)
-        except RuntimeError as e:
-            print(f"ERROR: {e}\nHint: press the device's accelerate button during capture, verify MAC/UUID, move closer.", file=sys.stderr)
-            return
-        print(f"   Empty mean raw = {R0}")
-
-        known = args.calibrate
-        input(f"2) Place the known mass (KG={known}) and press Enter. Averaging again...")
-        try:
-            R1 = await collect_mean_raw(args.mac, args.uuid, seconds=args.cal_seconds, debug=args.debug)
-        except RuntimeError as e:
-            print(f"ERROR: {e}\nHint: press the device's accelerate button during capture, verify MAC/UUID, move closer.", file=sys.stderr)
-            return
-        print(f"   Loaded mean raw = {R1}")
-
-        # Fit kg = m * raw + b ; with points (R0, 0) and (R1, known)
-        if R1 == R0:
-            print("Calibration failed: identical raw values. Try again.", file=sys.stderr)
-            return
-        m = known / (R1 - R0)
-        b = -m * R0
-        print(f"✅ Calibration complete: slope={m:.8f}, intercept={b:.8f}")
-        cal = Cal(m, b)
-        if args.save_cal:
-            with open(args.save_cal, "w") as f:
-                json.dump(cal.to_json(), f, indent=2)
-            print(f"💾 Saved calibration to {args.save_cal}")
-        print("Starting live read with new calibration...\n")
-        await run_live(args, cal)
+        await calibrate(args)
         return
 
-    # load existing cal if provided
-    cal = None
-    if args.load_cal:
-        with open(args.load_cal, "r") as f:
-            cal = Cal.from_json(json.load(f))
-        print(f"Loaded calibration: slope={cal.slope:.8f}, intercept={cal.intercept:.8f}")
-
-    await run_live(args, cal)
+    await live_read(args)
 
 
 if __name__ == "__main__":
