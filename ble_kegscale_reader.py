@@ -17,6 +17,7 @@ E4BE_UUID_16  = "e4be"
 @dataclass
 class Decoded:
     accelerated: bool
+    battery_raw: int
     battery_pct: int
     temperature_c: float
     seq_u32: int
@@ -37,7 +38,8 @@ def decode(payload: bytes) -> Decoded:
     # sanity: byte0 is flags: 0x20 normal, 0x21 accelerated
     accel_flag = b[0]
     accelerated = (accel_flag & 0x01) == 0x01
-    battery_pct = b[3]
+    battery_raw = b[2]
+    battery_pct = b[3]  # legacy field; we will compute display pct from battery_raw
     # TEMP: we don't fully trust the position; keep it as b[5]/10 for display only
     temperature_c = b[5] / 10.0
     seq_u32 = _u32be(b[6:10])
@@ -45,6 +47,7 @@ def decode(payload: bytes) -> Decoded:
     checksum_u8 = b[16]
     return Decoded(
         accelerated=accelerated,
+        battery_raw=battery_raw,
         battery_pct=battery_pct,
         temperature_c=temperature_c,
         seq_u32=seq_u32,
@@ -92,6 +95,7 @@ def find_payload(adv: AdvertisementData, want_uuid: Optional[str], debug: bool=F
     return None
 
 
+import time
 async def collect_mean_raw(mac_filter, uuid_key, seconds=2.0, debug=False):
     """
     Listen for `seconds` and return the mean of raw12_13 for matching device.
@@ -114,13 +118,25 @@ async def collect_mean_raw(mac_filter, uuid_key, seconds=2.0, debug=False):
     scanner = BleakScanner(detection_callback=cb)
     await scanner.start()
     try:
-        # sample a little longer than requested to ensure we have data
-        await asyncio.sleep(max(0.5, seconds))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max(0.5, seconds):
+            await asyncio.sleep(0.25)
+            if samples:
+                if time.monotonic() - t0 < seconds:
+                    continue
+                else:
+                    break
+        if not samples:
+            t1 = time.monotonic()
+            while time.monotonic() - t1 < 6.0:
+                await asyncio.sleep(0.25)
+                if samples:
+                    break
     finally:
         await scanner.stop()
 
     if not samples:
-        raise RuntimeError("No samples captured during calibration window.")
+        raise RuntimeError("No samples captured during calibration window. Check MAC/UUID, move device closer, or press the accelerate button.")
     return int(round(mean(samples)))
 
 async def main():
@@ -138,6 +154,9 @@ async def main():
     ap.add_argument("--cal-seconds", type=float, default=2.0, help="Seconds to average for each calibration capture.")
     ap.add_argument("--save-cal", help="Write computed slope/intercept to this JSON file.")
     ap.add_argument("--load-cal", help="Load slope/intercept from this JSON file (overrides defaults).")
+    ap.add_argument("--batt-max", type=int, default=22, help="Battery raw full-scale (default 22 → 15/22≈68%).")
+    ap.add_argument("--temp-offset", type=float, default=0.0, help="Add this °C offset to the decoded temperature.")
+    ap.add_argument("--dump-u16", action="store_true", help="Print u16 fields at [8:10],[10:12],[12:14],[14:16] (both LE/BE) for hunting the weight bytes.")
     args = ap.parse_args()
 
     mac_filter = args.mac.upper() if args.mac else None
@@ -213,8 +232,25 @@ async def main():
             zero_kg = kg
 
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        temp_disp = d.temperature_c + args.temp_offset
+        batt_pct_disp = max(0, min(100, round(100 * (d.battery_raw / max(1, args.batt_max)))))
+        dump_line = ""
+        if args.dump_u16:
+            b = bytes.fromhex(d.raw_hex)
+            def u16le(i):
+                return (b[i] | (b[i+1]<<8)) if i+1 < len(b) else None
+            def u16be(i):
+                return ((b[i]<<8) | b[i+1]) if i+1 < len(b) else None
+            fields = []
+            for i in (8,10,12,14):
+                le = u16le(i); be = u16be(i)
+                fields.append(f"u16@{i}(le)={le:5d}" if le is not None else f"u16@{i}(le)=  N/A")
+                fields.append(f"u16@{i}(be)={be:5d}" if be is not None else f"u16@{i}(be)=  N/A")
+            dump_line = "  [" + "  ".join(fields) + "]"
         base = (f"{now}  kg={kg:7.3f}"
                 f"{(f' zeroed={kg-zero_kg:7.3f}' if (args.zero and zero_kg is not None) else '')}"
+                f"  raw={raw_smoothed:5d}  temp={temp_disp:4.1f}°C"
+                f"  rssi={adv.rssi:3d}dBm  batt={batt_pct_disp:2d}%  "
                 f"  raw={raw_smoothed:5d}  temp={d.temperature_c:4.1f}°C"
                 f"  rssi={adv.rssi:3d}dBm  batt={d.battery_pct:2d}%  "
                 f"{'ACCEL' if d.accelerated else 'idle'}")
@@ -237,7 +273,8 @@ async def main():
                 "uuid": args.uuid,
                 "len": 17,
                 "accelerated": d.accelerated,
-                "battery_pct": d.battery_pct,
+                "battery_pct": max(0, min(100, round(100 * (d.battery_raw / max(1, args.batt_max))))),
+                "battery_raw": d.battery_raw,
                 "temperature_c": d.temperature_c,
                 "seq": d.seq_u32,
                 "raw12_13": d.raw12_13,
@@ -272,9 +309,4 @@ async def main():
             log_fp.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except RuntimeError:
-        import asyncio as _asyncio
-        loop = _asyncio.get_event_loop()
-        loop.run_until_complete(main())
+    asyncio.run(main())
