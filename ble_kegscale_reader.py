@@ -3,12 +3,12 @@
 # -*- coding: utf-8 -*-
 """
 BLE Keg Scale Reader & Calibrator (E4BE)
-- Configurable byte indices for raw/temp/batt to help locate correct fields
+- Advert mode only (your device is non-connectable): parse fields from Service Data
+- Configurable indices: --raw-index, --batt-index, --temp-index
+- NEW: --raw-shift to drop flaggy low bits (e.g., --raw-shift 8 to keep only the high byte)
 - Median-on-raw smoothing + stability gate
 - Two-point calibration persisted in JSON
-- Rich debugging: hex dump and u16 scan to identify correct offsets
-
-Tested with Python 3.11 and bleak 1.x on Raspberry Pi.
+- Debug helpers: --hex-dump, --scan-fields, --dump-u16
 """
 
 import argparse
@@ -35,7 +35,6 @@ def clip(x, lo, hi):
 
 
 def scan_u16_pairs(sd: bytes) -> List[Tuple[int,int,int]]:
-    """Return list of (i, le, be) for each 2-byte window starting at i."""
     out = []
     for i in range(0, max(0, len(sd)-1)):
         le = int.from_bytes(sd[i:i+2], "little", signed=False)
@@ -50,10 +49,10 @@ def parse_service_data(sd: bytes, *, args, dump_u16: bool = False) -> Dict[str, 
     if len(sd) < 2:
         raise ValueError(f"service_data too short: {len(sd)} bytes")
 
-    # Battery
+    # Battery (single byte)
     batt_raw = sd[args.batt_index] if args.batt_index < len(sd) else 0
 
-    # Temperature: configurable index, signed/unsigned, always little-endian for now
+    # Temperature (two bytes, deci-degC, LE by observation)
     if args.temp_index + 1 < len(sd):
         temp_raw_le = int.from_bytes(sd[args.temp_index:args.temp_index+2], byteorder="little", signed=args.temp_signed)
         temp_c = temp_raw_le / 10.0
@@ -61,16 +60,16 @@ def parse_service_data(sd: bytes, *, args, dump_u16: bool = False) -> Dict[str, 
         temp_raw_le = 0
         temp_c = 0.0
 
-    # RAW reading
+    # RAW u16 window
     if args.raw_index + 1 >= len(sd):
         raise ValueError(f"raw_index {args.raw_index} out of range for len={len(sd)}")
-    raw = int.from_bytes(sd[args.raw_index:args.raw_index+2], byteorder=args.endian, signed=False)
+    raw_u16 = int.from_bytes(sd[args.raw_index:args.raw_index+2], byteorder=args.endian, signed=False)
 
     out = {
         "batt_raw": batt_raw,
         "temp_raw": temp_raw_le,
         "temp_c": temp_c,
-        "raw": raw,
+        "raw_u16": raw_u16,
         "b_raw0": sd[args.raw_index],
         "b_raw1": sd[args.raw_index+1],
         "len": len(sd),
@@ -93,7 +92,10 @@ def map_temp(temp_c: float, temp_map: Optional[Dict[str, float]]) -> float:
 
 def map_batt(batt_raw: int, batt_map: Optional[Dict[str, float]]) -> int:
     if not batt_map:
-        # Fallback heuristic - scale 0..15 -> 0..100%
+        # If it already looks like percent 0..100, accept it
+        if 0 <= batt_raw <= 100:
+            return batt_raw
+        # Else fallback - scale 0..15 -> 0..100%
         if batt_raw <= 0x0F:
             pct = int(round((batt_raw / 15.0) * 100.0))
         else:
@@ -134,22 +136,21 @@ async def collect_mean_raw(target_mac: Optional[str], target_uuid: str, *, secon
         if target_mac_norm and mac_norm != target_mac_norm:
             return
         sd_dict = adv.service_data or {}
-        # allow any key that endswith uuid too (some stacks compress the key)
         sd = sd_dict.get(target_uuid)
         if not sd:
-            # Try short key variants if present
             for k, v in sd_dict.items():
-                if k.lower().endswith(target_uuid[-8:].lower()):  # crude suffix match
+                if k.lower().endswith(target_uuid[-8:].lower()):
                     sd = v
                     break
         if not sd:
             return
         try:
             fields = parse_service_data(sd, args=args, dump_u16=False)
-            raws.append(fields["raw"])
+            raw_val = fields["raw_u16"] >> max(0, args.raw_shift)
+            raws.append(raw_val)
             if debug:
-                print(f"[collect] len={len(sd)} raw={fields['raw']} @[{args.raw_index}:{args.raw_index+2}] "
-                      f"b0=0x{fields['b_raw0']:02x} b1=0x{fields['b_raw1']:02x}")
+                print(f"[collect] len={len(sd)} raw_u16={fields['raw_u16']} >>{args.raw_shift} -> {raw_val} "
+                      f"@[{args.raw_index}:{args.raw_index+2}] b0=0x{fields['b_raw0']:02x} b1=0x{fields['b_raw1']:02x}")
         except Exception as e:
             if debug:
                 print(f"[collect] parse error: {e}")
@@ -183,14 +184,6 @@ async def live_read(args):
     intercept = cal.get("intercept")
     temp_map = cal.get("temp_map")
     batt_map = cal.get("batt_map")
-    parser_meta = cal.get("parser", {})
-    if parser_meta and args.debug:
-        if (
-            parser_meta.get("endian") != args.endian
-            or parser_meta.get("raw_bytes") != [args.raw_index, args.raw_index+1]
-            or parser_meta.get("uuid", DEFAULT_SERVICE_UUID) != args.uuid
-        ):
-            print("[warn] Parser settings differ from saved calibration; weights may be off.")
 
     displayed_kg = 0.0
     zero_offset = 0.0 if not args.zero else 0.0
@@ -215,7 +208,6 @@ async def live_read(args):
 
         try:
             if args.hex_dump or args.scan_fields:
-                # dump once per second max
                 import time
                 t = int(time.time())
                 if t != last_dump:
@@ -232,15 +224,14 @@ async def live_read(args):
             temp_c_mapped = map_temp(fields["temp_c"], temp_map)
             batt_pct = map_batt(fields["batt_raw"], batt_map)
 
-            raw_buf.append(fields["raw"])
+            raw_val = fields["raw_u16"] >> max(0, args.raw_shift)
+            raw_buf.append(raw_val)
             raw_med = stats.median(raw_buf)
 
             if slope is not None and intercept is not None:
                 kg_now = slope * raw_med + intercept
-                if args.temp_comp and cal.get("temp_ref") is not None:
-                    kg_now -= cal.get("temp_coeff", 0.0) * (temp_c_mapped - cal.get("temp_ref", temp_c_mapped))
             else:
-                kg_now = 0.0
+                kg_now = 0.0  # uncalibrated
 
             if args.zero:
                 if zero_offset == 0.0:
@@ -294,11 +285,10 @@ async def calibrate(args):
     cal.update({
         "slope": slope,
         "intercept": intercept,
-        "temp_ref": 20.0,
-        "temp_coeff": cal.get("temp_coeff", 0.0),
         "parser": {
             "endian": args.endian,
             "raw_bytes": [args.raw_index, args.raw_index+1],
+            "raw_shift": args.raw_shift,
             "uuid": args.uuid,
         },
         "batt_map": cal.get("batt_map"),
@@ -320,8 +310,9 @@ def build_arg_parser():
     p.add_argument("--uuid", default=DEFAULT_SERVICE_UUID, help="Service UUID key containing the service data")
     p.add_argument("--endian", choices=["little", "big"], default="little", help="Endian for RAW field")
 
-    p.add_argument("--raw-index", type=int, default=12, help="Start byte index for RAW u16 field")
-    p.add_argument("--batt-index", type=int, default=2, help="Byte index for battery raw")
+    p.add_argument("--raw-index", type=int, default=15, help="Start byte index for RAW u16 field")
+    p.add_argument("--raw-shift", type=int, default=0, help="Right shift to apply to RAW before use (e.g., 8)")
+    p.add_argument("--batt-index", type=int, default=3, help="Byte index for battery raw")
     p.add_argument("--temp-index", type=int, default=5, help="Start byte for temperature (deci-degC, LE)")
     p.add_argument("--temp-signed", action="store_true", default=True, help="Treat temperature as signed 16-bit")
     p.add_argument("--temp-unsigned", dest="temp_signed", action="store_false", help="Treat temperature as unsigned")
@@ -340,7 +331,7 @@ def build_arg_parser():
     p.add_argument("--save-cal", default="keg_cal.json", help="Path to save calibration JSON")
     p.add_argument("--load-cal", default=None, help="Path to load calibration JSON (else will use --save-cal if exists)")
 
-    p.add_argument("--temp-comp", action="store_true", help="Enable temp compensation using JSON temp_coeff & temp_ref")
+    p.add_argument("--temp-comp", action="store_true", help="Reserved (no-op in advert mode)")
     p.add_argument("--stable-sd", type=float, default=4.0, help="Stability gate: stdev threshold on raw counts")
     p.add_argument("--stable-slope", type=float, default=1.5, help="Stability gate: absolute slope counts/step threshold")
 
