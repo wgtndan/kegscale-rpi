@@ -91,6 +91,38 @@ def find_payload(adv: AdvertisementData, want_uuid: Optional[str], debug: bool=F
                 return b
     return None
 
+
+async def collect_mean_raw(mac_filter, uuid_key, seconds=2.0, debug=False):
+    """
+    Listen for `seconds` and return the mean of raw12_13 for matching device.
+    """
+    from statistics import mean
+    samples = []
+
+    def cb(device, adv: AdvertisementData):
+        if mac_filter and ((device.address or "").upper() != mac_filter):
+            return
+        payload = find_payload(adv, uuid_key, debug=debug)
+        if not payload:
+            return
+        try:
+            d = decode(payload)
+        except Exception:
+            return
+        samples.append(d.raw12_13)
+
+    scanner = BleakScanner(detection_callback=cb)
+    await scanner.start()
+    try:
+        # sample a little longer than requested to ensure we have data
+        await asyncio.sleep(max(0.5, seconds))
+    finally:
+        await scanner.stop()
+
+    if not samples:
+        raise RuntimeError("No samples captured during calibration window.")
+    return int(round(mean(samples)))
+
 async def main():
     ap = argparse.ArgumentParser(description="BLE kegscale reader with linear weight model and smoothing.")
     ap.add_argument("--mac", help="Filter to a specific MAC (case-insensitive).")
@@ -102,10 +134,54 @@ async def main():
     ap.add_argument("--log-file", help="Write NDJSON to this file.")
     ap.add_argument("--print-raw", action="store_true", help="Also print raw_hex and bytes[12:14] for the first few packets.")
     ap.add_argument("--debug", action="store_true", help="Extra diagnostics to stderr.")
-    args = ap.parse_args()
+    ap.add_argument("--calibrate", type=float, metavar="KG", help="Guided two-point calibration with known mass KG.")
+ap.add_argument("--cal-seconds", type=float, default=2.0, help="Seconds to average for each calibration capture.")
+ap.add_argument("--save-cal", help="Write computed slope/intercept to this JSON file.")
+ap.add_argument("--load-cal", help="Load slope/intercept from this JSON file (overrides defaults).")
+args = ap.parse_args()
 
     mac_filter = args.mac.upper() if args.mac else None
+if args.load_cal:
+    try:
+        with open(args.load_cal) as f:
+            cal = json.load(f)
+            if "slope" in cal: args.slope = float(cal["slope"])
+            if "intercept" in cal: args.intercept = float(cal["intercept"])
+            print(f"📥 Loaded calibration from {args.load_cal}: slope={args.slope:.8f}, intercept={args.intercept:.8f}")
+    except Exception as e:
+        print(f"⚠️  Could not load calibration: {e}", file=sys.stderr)
 
+
+
+    # Guided calibration
+    if args.calibrate is not None:
+        print("🧪 Calibration mode")
+        print("1) Leave the scale EMPTY and press Enter. I will average raw for a few seconds...")
+        input()
+        R0 = await collect_mean_raw(mac_filter, args.uuid, seconds=args.cal_seconds, debug=args.debug)
+        print(f"   Empty mean raw = {R0}")
+
+        print(f"2) Place the known mass (KG={args.calibrate:.3f}) and press Enter. Averaging again...")
+        input()
+        R1 = await collect_mean_raw(mac_filter, args.uuid, seconds=args.cal_seconds, debug=args.debug)
+        print(f"   Loaded mean raw = {R1}")
+
+        if R1 == R0:\n            raise RuntimeError("Calibration failed: raw did not change between empty and loaded.")
+
+        slope = args.calibrate / (R1 - R0)
+        intercept = -slope * R0
+        args.slope, args.intercept = slope, intercept
+        print(f"✅ Calibration complete: slope={slope:.8f}, intercept={intercept:.8f}")
+
+        if args.save_cal:
+            try:
+                with open(args.save_cal, "w") as f:
+                    json.dump({"slope": slope, "intercept": intercept}, f, indent=2)
+                print(f"💾 Saved calibration to {args.save_cal}")
+            except Exception as e:
+                print(f"⚠️  Could not save calibration: {e}", file=sys.stderr)
+
+        print("Starting live read with new calibration...\n")
     raw_buf = deque(maxlen=max(args.smooth, 1))
     zero_kg: Optional[float] = None
     log_fp = open(args.log_file, "a", buffering=1) if args.log_file else None
