@@ -8,9 +8,10 @@ Log raw Service Data bytes from E4BE adverts to a CSV for vendor analysis.
 Columns include timestamp, RSSI, full hex payload, each byte b[0..N-1],
 u16le windows [i..i+1], and convenience fields: battery_raw (b[3]), temp_raw_le (b[5:7], LE), temp_c, frame_id (b[16]).
 """
-
 import argparse
 import asyncio
+import csv
+import datetime  # <-- ADD THIS
 from bleak import BleakScanner
 
 DEFAULT_UUID = "0000e4be-0000-1000-8000-00805f9b34fb"
