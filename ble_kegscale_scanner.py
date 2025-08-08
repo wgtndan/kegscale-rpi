@@ -108,10 +108,18 @@ async def run(adapter: str, duration: float, once: bool, csv_path: str | None):
         ts = datetime.now(timezone.utc).isoformat()
         decoded = decode_service_data(payload)
 
+        # Prefer RSSI from advertisement_data; fall back to device.metadata if missing
+        rssi = getattr(advertisement_data, "rssi", None)
+        rssi_source = "adv"
+        if rssi is None:
+            rssi = (getattr(device, "metadata", {}) or {}).get("rssi")
+            rssi_source = "device.metadata" if rssi is not None else "unknown"
+
         record = {
             "ts_iso": ts,
             "mac": device.address,
-            "rssi": device.rssi,
+            "rssi": rssi,
+            "rssi_source": rssi_source,
             "uuid": SERVICE_UUID_128,
             **decoded,
         }
@@ -124,7 +132,7 @@ async def run(adapter: str, duration: float, once: bool, csv_path: str | None):
             csv_writer.writerow([
                 ts,
                 device.address,
-                device.rssi,
+                advertisement_data.rssi,
                 decoded.get("raw_hex"),
                 decoded.get("battery_pct_guess"),
                 decoded.get("temperature_c"),
