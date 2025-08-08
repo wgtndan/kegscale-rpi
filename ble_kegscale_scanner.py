@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-kegscale_scanner.py  (robust matching)
--------------------------------------
-Fixes:
-- Removed strict scanner filter (service_uuids=[...]) which can drop packets
-  when devices don't include the Service UUID list in their ADV.
-- More robust matching of service_data keys (case-insensitive, 16-bit/128-bit).
-- Fallback: if no explicit match, accept any 17-byte service_data value.
-
-Decodes:
-- Accelerated flag (button-press fast advertising)
-- Battery percentage
-- Temperature (°C)
-- Sequence/counter
-- Weight raw (u16) + optional linear calibration to kg
-- State/range code (u16)
-
-Usage:
-  pip3 install bleak
-  python3 kegscale_scanner.py --mac 5C:01:3B:35:92:EE --log-file beacons.ndjson --debug
+ble_kegscale_scanner.py
+-----------------------
+- Robust E4BE payload matching (no strict scan filter).
+- Decodes accelerated flag, battery, temp, seq, weight_raw (u16), state code, checksum.
+- Optional per-state calibration via --cal-file JSON:
+    {
+      "0x0100": {"a": -0.0016956, "b": 37.42},
+      "0x0101": {"a": -0.0016956, "b": 37.05},
+      "0x0102": {"a": -0.0016956, "b": 36.50}
+    }
+  Formula: kg = a * weight_raw_u16 + b   (using state-specific a/b if available)
 """
 
 import argparse
@@ -27,18 +19,12 @@ import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from bleak import BleakScanner, AdvertisementData
 
 E4BE_UUID_128 = "0000e4be-0000-1000-8000-00805f9b34fb"
 E4BE_UUID_16  = "e4be"
-
-
-@dataclass
-class WeightCal:
-    """Linear calibration: kg = a * raw + b"""
-    a: float = 0.0
-    b: float = 0.0
 
 
 @dataclass
@@ -86,25 +72,11 @@ def decode_payload(payload: bytes) -> DecodedFrame:
     )
 
 
-def apply_weight_calibration(raw: int, cal: WeightCal | None) -> float | None:
-    if cal is None:
-        return None
-    return cal.a * raw + cal.b
-
-
-def ndjson_dump(fp, obj: dict):
-    fp.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    fp.flush()
-
-
 def _find_e4be_payload(adv: AdvertisementData, want_uuid: str | None, debug: bool = False) -> bytes | None:
-    """Return the E4BE payload bytes from AdvertisementData.service_data, if present."""
     if not adv.service_data:
         return None
 
-    # Normalize UUID strings
     want = (want_uuid or "").lower()
-    # Accept both 128-bit and 16-bit representations for matching
     candidates = []
     for key, val in adv.service_data.items():
         k = str(key).lower()
@@ -112,47 +84,72 @@ def _find_e4be_payload(adv: AdvertisementData, want_uuid: str | None, debug: boo
             if k == want or k.endswith(want) or want.endswith(k):
                 candidates.append(val)
                 continue
-        # Generic acceptance for E4BE keys
         if k == E4BE_UUID_128 or k.endswith(E4BE_UUID_128) or k == E4BE_UUID_16 or k.endswith(E4BE_UUID_16):
             candidates.append(val)
 
-    # Prefer any 17-byte payload among candidates
     for v in candidates:
         if isinstance(v, (bytes, bytearray)) and len(v) == 17:
             return bytes(v)
 
-    # Fallback: search ANY 17-byte service_data value
     for v in adv.service_data.values():
         if isinstance(v, (bytes, bytearray)) and len(v) == 17:
             if debug:
                 sys.stderr.write("⚠️  Using 17-byte fallback (no UUID key match).\n")
             return bytes(v)
 
-    # Nothing matched
     return None
 
 
+def load_calibration(path: str | None) -> dict[str, dict] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        sys.stderr.write(f"⚠️ Calibration file not found: {path}\n")
+        return None
+    try:
+        with open(p, "r") as f:
+            data = json.load(f)
+        # normalize keys
+        out = {}
+        for k, v in data.items():
+            key = k.lower()
+            if not key.startswith("0x"):
+                key = f"0x{int(k):04x}"
+            out[key] = {"a": float(v["a"]), "b": float(v["b"])}
+        return out
+    except Exception as e:
+        sys.stderr.write(f"⚠️ Failed to load calibration file {path}: {e}\n")
+        return None
+
+
+def predict_weight_kg(raw: int, state_code: int, cal_map: dict[str, dict] | None) -> float | None:
+    if cal_map is None:
+        return None
+    key_hex = f"0x{state_code:04x}"
+    c = cal_map.get(key_hex)
+    if not c:
+        return None
+    return c["a"] * float(raw) + c["b"]
+
+
 async def main():
-    parser = argparse.ArgumentParser(description="Scan and decode keg scale E4BE beacons (robust).")
+    parser = argparse.ArgumentParser(description="Scan and decode keg scale E4BE beacons with per-state calibration.")
     parser.add_argument("--mac", help="Filter for a specific MAC (case-insensitive).")
     parser.add_argument("--uuid", default=E4BE_UUID_128, help="Service UUID to parse (128- or 16-bit ok).")
     parser.add_argument("--log-file", help="Write NDJSON lines to this file.")
     parser.add_argument("--print-raw", action="store_true", help="Include raw Bleak advertisement fields in stderr.")
     parser.add_argument("--debug", action="store_true", help="Extra diagnostics to stderr.")
-    parser.add_argument("--cal-a", type=float, default=None, help="Weight calibration slope a (kg per raw).")
-    parser.add_argument("--cal-b", type=float, default=None, help="Weight calibration intercept b (kg at raw=0).")
+    parser.add_argument("--cal-file", help="Path to per-state calibration JSON.")
     args = parser.parse_args()
 
     mac_filter = args.mac.upper() if args.mac else None
-    cal = None
-    if args.cal_a is not None and args.cal_b is not None:
-        cal = WeightCal(a=args.cal_a, b=args.cal_b)
+    cal_map = load_calibration(args.cal_file)
 
     log_fp = open(args.log_file, "a", buffering=1) if args.log_file else None
 
     def detection_callback(device, adv: AdvertisementData):
         try:
-            # Filter MAC if requested
             if mac_filter and (device.address or "").upper() != mac_filter:
                 return
 
@@ -163,6 +160,8 @@ async def main():
                 return
 
             decoded = decode_payload(payload)
+
+            kg_pred = predict_weight_kg(decoded.weight_raw_u16, decoded.state_code_u16, cal_map)
 
             now = datetime.now(timezone.utc).isoformat()
             record = {
@@ -178,7 +177,7 @@ async def main():
                 "temperature_c": decoded.temp_c,
                 "seq": decoded.seq,
                 "weight_raw_u16": decoded.weight_raw_u16,
-                "weight_kg": apply_weight_calibration(decoded.weight_raw_u16, cal),
+                "weight_kg": kg_pred,
                 "state_code_u16": decoded.state_code_u16,
                 "checksum_u8": decoded.checksum_u8,
             }
@@ -186,7 +185,8 @@ async def main():
             print(json.dumps(record, separators=(",", ":")))
 
             if log_fp:
-                ndjson_dump(log_fp, record)
+                log_fp.write(json.dumps(record, separators=(",", ":")) + "\n")
+                log_fp.flush()
 
             if args.print_raw or args.debug:
                 dbg = {
@@ -201,7 +201,6 @@ async def main():
             if args.debug:
                 sys.stderr.write(f"decode error: {e}\n")
 
-    # IMPORTANT: no strict service_uuids filter here (some devices omit it)
     scanner = BleakScanner(detection_callback=detection_callback)
 
     print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
