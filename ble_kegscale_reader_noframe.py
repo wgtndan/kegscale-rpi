@@ -34,31 +34,32 @@ def parse_args():
     p.add_argument("--frame-index", type=int, default=-1, help="Byte index that carries a page/frame id (-1 disables)")
     p.add_argument("--frame-value", type=lambda s: int(s, 0), default=None, help="Specific frame value to accept (e.g. 0xFE)")
     p.add_argument("--smooth", type=int, default=5, help="Rolling average window for raw value")
-    p.add_argument("--print-raw", action="store_true", help="Also print the service-data hex payload(s)")
+    p.add_argument("--print-raw", dest="print_raw", action="store_true", help="Also print the service-data hex payload(s)")
     return p.parse_args()
 
 def ts():
     return datetime.now().isoformat(timespec="seconds")
 
-def select_service_data(svc: dict, uuid_filter: str | None) -> list[tuple[str, bytes]]:
+def select_service_data(svc, uuid_filter):
     """Return list of (uuid, bytes) service data entries to consider."""
     if not svc:
         return []
     if not uuid_filter:
         return list(svc.items())
-    # exact match or suffix match for 128-bit UUID string
     out = []
+    suf = uuid_filter[-8:].lower()
     for k, v in svc.items():
-        if k.lower() == uuid_filter.lower() or k.lower().endswith(uuid_filter[-8:].lower()):
+        kl = k.lower()
+        if kl == uuid_filter.lower() or kl.endswith(suf):
             out.append((k, v))
     return out
 
-def extract_u16(data: bytes, idx: int, endian: str) -> int | None:
+def extract_u16(data, idx, endian):
     if idx is None or idx < 0 or idx + 1 >= len(data):
         return None
     return int.from_bytes(data[idx:idx+2], endian, signed=False)
 
-def apply_byte_select_and_shift(val: int | None, raw_byte: str, shift: int) -> int | None:
+def apply_byte_select_and_shift(val, raw_byte, shift):
     if val is None:
         return None
     if raw_byte == "low":
@@ -118,7 +119,7 @@ async def main():
                 frame = data[args.frame_index]
 
             # Print
-            rssi = getattr(advertisement_data, "rssi", None) or getattr(device, "rssi", None)
+            rssi = getattr(advertisement_data, "rssi", None)
             line = f"{ts()} mac={device.address} rssi={rssi} uuid={uuid}"
             if frame is not None:
                 line += f" frame=0x{frame:02x}"
@@ -128,11 +129,10 @@ async def main():
                 line += f" temp={temp_c:.1f}°C"
             if batt is not None:
                 line += f" batt={batt}%"
-            if args.print-raw:
+            if args.print_raw:
                 line += f" sd={data.hex()}"
             print(line)
 
-    # Use BleakScanner with detection_callback (Bleak 1.0.x style)
     scanner = BleakScanner(detection_callback=callback)
     await scanner.start()
     print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
