@@ -4,29 +4,25 @@ from typing import Dict, Any
 def decode_e4be(payload: bytes) -> Dict[str, Any]:
     """Decode your device's Service Data payload for UUID 0xE4BE.
 
-    Notes from investigation:
-    - Temperature: bytes 5-6 as deci-deg C (e.g., 0x00E9 -> 23.3°C), endianness may be big per your logs.
-    - Battery: likely byte 2 as a raw level (mapping to % needs confirmation).
-    - Weight: 32-bit little-endian *signed* at bytes 13..16. Value decreases when weight is added (needs linear transform).
+    Mapping (confirmed by live tests):
+    - Temperature: byte[5] as deci-deg C (e.g., 0xD5 -> 21.3°C). **One byte only.**
+    - Battery (raw guess): byte[2].
+    - Weight (raw): 32-bit little-endian *signed* at bytes [13:17].
     """
     out: Dict[str, Any] = {}
-
-    # Guard
     n = len(payload)
 
-    # Temperature (bytes 5..6), adjust endianness if needed
-    if n >= 7:
-        temp_raw = int.from_bytes(payload[5:7], "big", signed=False)
-        out["temp_c"] = temp_raw / 10.0
+    # Temperature (byte 5): deci-degrees Celsius
+    if n > 5:
+        out["temp_c"] = payload[5] / 10.0
 
-    # Battery (byte 2) — keep raw and simple passthrough; caller can map to %
-    if n >= 3:
+    # Battery (byte 2) — raw value
+    if n > 2:
         out["battery_raw"] = payload[2]
 
-    # Weight raw 32-bit little-endian signed at bytes 13..16
-    if n >= 16:
-        weight_raw = int.from_bytes(payload[12:16], "little", signed=True)
-        out["weight_raw"] = weight_raw
+    # Weight raw 32-bit little-endian signed at bytes 13..16 (slice [13:17])
+    if n > 16:
+        out["weight_raw"] = int.from_bytes(payload[13:17], "little", signed=True)
 
     return out
 
