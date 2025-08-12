@@ -1,15 +1,16 @@
 
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ble_kegscale_reader_noframe.py
-Works with Bleak 1.0.x (uses scanner.register_callback). No frame filtering by default.
+Compatible with Bleak 1.0.x (uses BleakScanner(detection_callback=...)).
+No frame filtering by default; you can enable it with --frame-index/--frame-value.
 
-- Reads BLE advertising "service data" (E4BE UUID or any present)
-- Optionally extracts a u16 field at --raw-index (LE/BE), with --raw-byte and --raw-shift
-- Optional frame gating via --frame-index and --frame-value (but disabled by default)
-- Prints battery/temp if indices are provided
+Features
+- Reads BLE advertising service data (optionally filter by UUID)
+- Optional u16 extraction at --raw-index (LE/BE), with --raw-byte and --raw-shift
+- Optional frame gating (disabled by default)
+- Prints temp (b[5:7] LE deci-°C) and battery (b[3]) if indices provided
 - Rolling average with --smooth
 """
 
@@ -22,6 +23,7 @@ from bleak import BleakScanner
 def parse_args():
     p = argparse.ArgumentParser(description="BLE Kegscale reader (advert-mode, no frame filtering by default)")
     p.add_argument("--mac", required=True, help="Target MAC address (case-insensitive)")
+    p.add_argument("--uuid", default=None, help="Optional Service UUID to select from service_data (e.g., 0000e4be-0000-1000-8000-00805f9b34fb)")
     p.add_argument("--raw-index", type=int, default=-1, help="Start byte for u16 raw field (-1 disables extraction)")
     p.add_argument("--endian", choices=["little", "big"], default="little", help="Endianness for u16 raw field")
     p.add_argument("--raw-shift", type=int, default=0, help="Right-shift to apply to the raw value (e.g. 8)")
@@ -38,9 +40,18 @@ def parse_args():
 def ts():
     return datetime.now().isoformat(timespec="seconds")
 
-def get_service_data(adv):
-    # Return dict {uuid: bytes} (already provided by Bleak)
-    return adv.service_data or {}
+def select_service_data(svc: dict, uuid_filter: str | None) -> list[tuple[str, bytes]]:
+    """Return list of (uuid, bytes) service data entries to consider."""
+    if not svc:
+        return []
+    if not uuid_filter:
+        return list(svc.items())
+    # exact match or suffix match for 128-bit UUID string
+    out = []
+    for k, v in svc.items():
+        if k.lower() == uuid_filter.lower() or k.lower().endswith(uuid_filter[-8:].lower()):
+            out.append((k, v))
+    return out
 
 def extract_u16(data: bytes, idx: int, endian: str) -> int | None:
     if idx is None or idx < 0 or idx + 1 >= len(data):
@@ -63,17 +74,17 @@ async def main():
     target_mac = args.mac.replace(":", "").lower()
     window = deque(maxlen=max(1, args.smooth))
 
-    def callback(device, adv):
+    def callback(device, advertisement_data):
         # Filter by MAC
         if device.address.replace(":", "").lower() != target_mac:
             return
 
-        svc = get_service_data(adv)
-        if not svc:
+        svc = advertisement_data.service_data or {}
+        entries = select_service_data(svc, args.uuid)
+        if not entries:
             return
 
-        # Iterate all service data entries (there can be several UUIDs)
-        for uuid, payload in svc.items():
+        for uuid, payload in entries:
             data = bytes(payload)
 
             # Optional frame gating
@@ -107,8 +118,7 @@ async def main():
                 frame = data[args.frame_index]
 
             # Print
-            hex_blob = data.hex() if args.print_raw else None
-            rssi = adv.rssi  # Bleak 1.0.x provides RSSI on advertisement data
+            rssi = getattr(advertisement_data, "rssi", None) or getattr(device, "rssi", None)
             line = f"{ts()} mac={device.address} rssi={rssi} uuid={uuid}"
             if frame is not None:
                 line += f" frame=0x{frame:02x}"
@@ -118,12 +128,12 @@ async def main():
                 line += f" temp={temp_c:.1f}°C"
             if batt is not None:
                 line += f" batt={batt}%"
-            if hex_blob:
-                line += f" sd={hex_blob}"
+            if args.print-raw:
+                line += f" sd={data.hex()}"
             print(line)
 
-    scanner = BleakScanner()
-    scanner.register_callback(callback)
+    # Use BleakScanner with detection_callback (Bleak 1.0.x style)
+    scanner = BleakScanner(detection_callback=callback)
     await scanner.start()
     print("🔍 Listening for BLE advertisements... (Ctrl+C to stop)")
     try:
