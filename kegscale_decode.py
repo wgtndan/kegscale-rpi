@@ -31,4 +31,4 @@ def linear_weight_kg(weight_raw: int, tare: int = 0, scale: float = -1.0) -> flo
     Default scale=-1.0 reflects that raw decreases as real weight increases.
     Calibrate 'tare' and 'scale' from two known points.
     """
-    return (weight_raw - tare) * scale
+    return (tare - weight_raw) * scale
