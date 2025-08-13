@@ -149,8 +149,12 @@ class KegScaleBLEScanner:
         self.scan_count += 1
         
         # Filter devices if specified
-        if self.device_filter and self.device_filter.lower() not in device.name.lower():
-            return
+        if self.device_filter:
+            device_name = device.name or ""
+            device_address = device.address or ""
+            if (self.device_filter.lower() not in device_name.lower() and 
+                self.device_filter.lower() not in device_address.lower()):
+                return
         
         # Look for manufacturer data or service data
         manufacturer_data = advertisement_data.manufacturer_data
@@ -202,7 +206,9 @@ async def main():
     """
     Main function to run the KegScale BLE scanner.
     """
-    scanner = KegScaleBLEScanner(device_filter="keg")  # Filter for devices with "keg" in name
+    # Target your specific KegScale device
+    target_mac = "5C:01:3B:35:92:EE"
+    scanner = KegScaleBLEScanner(device_filter=target_mac)
     await scanner.scan(duration=60)  # Scan for 60 seconds
 
 
