@@ -106,7 +106,19 @@ class KegScaleDecoder:
             # Extract raw weight (bytes 13-17, little endian, signed)
             weight_raw = int.from_bytes(payload[13:17], "little", signed=True)
             decoded["weight_raw"] = weight_raw
-            decoded["weight_grams"] = weight_raw  # Assuming grams
+            
+            # Apply calibration from your existing constants
+            DEFAULT_TARE = 118_295
+            DEFAULT_SCALE = 0.000000045885  # kg per raw unit
+            
+            # Use your linear_weight_kg formula: (tare - weight_raw) * scale
+            calibrated_kg = (DEFAULT_TARE - weight_raw) * DEFAULT_SCALE
+            decoded["weight_kg_calibrated"] = calibrated_kg
+            decoded["weight_grams_calibrated"] = calibrated_kg * 1000.0
+            decoded["weight_pounds_calibrated"] = calibrated_kg * 2.20462
+            
+            # Also keep raw conversions for comparison
+            decoded["weight_grams"] = weight_raw  # Raw value
             decoded["weight_kg"] = weight_raw / 1000.0
             decoded["weight_pounds"] = weight_raw * 0.00220462
             
