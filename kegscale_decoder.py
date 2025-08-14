@@ -103,8 +103,9 @@ class KegScaleDecoder:
             return decoded
         
         try:
-            # Extract raw weight (bytes 13-17, little endian, signed)
-            weight_raw = int.from_bytes(payload[13:17], "little", signed=True)
+            # Extract raw weight (bytes 12-16, little endian, signed)
+            # Analysis shows bytes 12-16 give more reasonable values than 13-17
+            weight_raw = int.from_bytes(payload[12:16], "little", signed=True)
             decoded["weight_raw"] = weight_raw
             
             # Apply calibration from your existing constants
@@ -160,6 +161,7 @@ class KegScaleBLEScanner:
         self.decoder = KegScaleDecoder()
         self.device_filter = device_filter
         self.scan_count = 0
+        self.kegscale_count = 0
     
     def detection_callback(self, device: BLEDevice, advertisement_data: AdvertisementData):
         """
@@ -167,39 +169,43 @@ class KegScaleBLEScanner:
         """
         self.scan_count += 1
         
-        # Filter devices if specified
-        if self.device_filter:
-            device_name = device.name or ""
-            device_address = device.address or ""
-            if (self.device_filter.lower() not in device_name.lower() and 
-                self.device_filter.lower() not in device_address.lower()):
-                return
+        # Filter for KegScale devices by checking for service data with the target UUID
+        target_service_uuid = "0000e4be-0000-1000-8000-00805f9b34fb"
         
-        # Look for manufacturer data or service data
-        manufacturer_data = advertisement_data.manufacturer_data
+        # Check if this device has KegScale service data
         service_data = advertisement_data.service_data
+        has_kegscale_service = False
+        kegscale_data = None
         
-        print(f"\n--- Scan #{self.scan_count} ---")
-        print(f"Device: {device.name} ({device.address})")
-        print(f"RSSI: {advertisement_data.rssi} dBm")
+        # Check for KegScale service data
+        if service_data:
+            for uuid, data in service_data.items():
+                if str(uuid).lower() == target_service_uuid.lower():
+                    has_kegscale_service = True
+                    kegscale_data = data
+                    break
         
-        # Process manufacturer data
-        for company_id, data in manufacturer_data.items():
-            print(f"Manufacturer ID: 0x{company_id:04X}")
-            decoded = self.decoder.decode_kegscale_beacon(data)
-            print("Decoded Data:")
+        # Only process devices with the KegScale service data
+        if not has_kegscale_service:
+            return
+        
+        # Process the KegScale service data we found
+        if kegscale_data:
+            self.kegscale_count += 1
+            decoded = self.decoder.decode_kegscale_beacon(kegscale_data)
+            print(f"\n--- KegScale Beacon #{self.kegscale_count} (Total Scan #{self.scan_count}) ---")
+            print(f"Device: {device.name} ({device.address})")
+            print(f"RSSI: {advertisement_data.rssi} dBm")
+            print("Decoded KegScale Data:")
             print(json.dumps(decoded, indent=2))
         
-        # Process service data
-        for service_uuid, data in service_data.items():
-            print(f"Service UUID: {service_uuid}")
-            decoded = self.decoder.decode_kegscale_beacon(data)
-            print("Service Data Decoded:")
-            print(json.dumps(decoded, indent=2))
-        
-        # Also show raw advertisement data
-        if hasattr(advertisement_data, 'manufacturer_data') or hasattr(advertisement_data, 'service_data'):
-            print(f"Raw adv data: {advertisement_data}")
+        # Also check manufacturer data in case KegScale uses it
+        manufacturer_data = advertisement_data.manufacturer_data
+        if manufacturer_data:
+            for company_id, data in manufacturer_data.items():
+                decoded = self.decoder.decode_kegscale_beacon(data)
+                print(f"\nManufacturer Data (0x{company_id:04X}):")
+                print(json.dumps(decoded, indent=2))
     
     async def scan(self, duration=30):
         """
@@ -218,17 +224,16 @@ class KegScaleBLEScanner:
             print("\nScan interrupted by user")
             await scanner.stop()
         
-        print(f"\nScan completed. Total devices detected: {self.scan_count}")
+        print(f"\nScan completed. Total devices detected: {self.scan_count}, KegScale beacons: {self.kegscale_count}")
 
 
 async def main():
     """
     Main function to run the KegScale BLE scanner.
     """
-    # Target your specific KegScale device
-    target_mac = "5C:01:3B:35:92:EE"
-    scanner = KegScaleBLEScanner(device_filter=target_mac)
-    await scanner.scan(duration=60)  # Scan for 60 seconds
+    # Use service UUID filtering instead of MAC address (works on macOS)
+    scanner = KegScaleBLEScanner()  # No device filter needed - we filter by service UUID
+    await scanner.scan(duration=120)  # Scan for 120 seconds
 
 
 if __name__ == "__main__":
